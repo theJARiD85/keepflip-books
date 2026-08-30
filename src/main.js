@@ -213,8 +213,12 @@ function rowPath(configuration, tableId, rowId) {
   return `${tableRowsPath(configuration, tableId)}/${encodeURIComponent(rowId)}`;
 }
 
-function createQuery(method, attribute, values = []) {
-  return `${method}("${attribute}", [${values.map((value) => JSON.stringify(value)).join(',')}])`;
+function createQuery(method, attribute = '', values = []) {
+  return JSON.stringify({
+    ...(attribute ? { attribute } : {}),
+    method,
+    ...(values.length ? { values } : {}),
+  });
 }
 
 function listRowsPath(configuration, tableId, queries) {
@@ -1013,7 +1017,7 @@ async function findItemForEbayEvent({ runtime, configuration, apiKey, ownerId, i
           path: listRowsPath(configuration, configuration.itemsTableId, [
             createQuery('equal', 'ownerId', [ownerId]),
             createQuery('equal', column, [value]),
-            'limit(1)',
+            createQuery('limit', '', [1]),
           ]),
           runtime,
         });
@@ -1117,6 +1121,20 @@ async function handleParsedEbayEvent({ runtime, configuration, apiKey, ownerId, 
   return result.status;
 }
 
+export function isSyncEligibleEbayConnection(connection, ownerId, environment) {
+  const storedEnvironment = text(connection?.environment, 16).toLowerCase();
+  // Older connection rows predate the optional environment column. Their
+  // deterministic row ID already includes the owner and requested environment,
+  // and this check still verifies the loaded row belongs to the signed-in user.
+  return Boolean(
+    connection &&
+      ownerIdFromRow(connection) === ownerId &&
+      (!storedEnvironment || storedEnvironment === environment) &&
+      !connection.revokedAt &&
+      text(connection.status, 32).toLowerCase() !== 'revoked'
+  );
+}
+
 async function handleEbaySync({ req, res, runtime, fetchImpl, now }) {
   const body = requestBody(req);
   const ownerId = await authenticatedUserId({ fetchImpl, req, runtime });
@@ -1130,13 +1148,7 @@ async function handleEbaySync({ req, res, runtime, fetchImpl, now }) {
     runtime,
     tableId: configuration.connectionsTableId,
   });
-  if (
-    !connection ||
-    ownerIdFromRow(connection) !== ownerId ||
-    text(connection.environment, 16) !== configuration.environment ||
-    connection.revokedAt ||
-    text(connection.status, 32).toLowerCase() === 'revoked'
-  ) {
+  if (!isSyncEligibleEbayConnection(connection, ownerId, configuration.environment)) {
     throw new HttpError(401, 'Reconnect eBay before syncing its financial activity.');
   }
   const window = financeWindow(body, now);
@@ -1243,8 +1255,8 @@ async function handleOverview({ req, res, runtime, fetchImpl }) {
     fetchImpl,
     path: listRowsPath(configuration, configuration.journalLinesTableId, [
       createQuery('equal', 'ownerId', [ownerId]),
-      'orderDesc("occurredAt")',
-      'limit(1000)',
+      createQuery('orderDesc', 'occurredAt'),
+      createQuery('limit', '', [1000]),
     ]),
     runtime,
   });
