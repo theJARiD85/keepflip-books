@@ -1302,7 +1302,6 @@ export function createHandler({ error, log, fetchImpl = fetch, now = () => new D
       }
       error(404, 'Books endpoint not found.');
     } catch (error) {
-      error(error);
       safeError(log, error, method, path);
       return jsonError(res, error);
     }
