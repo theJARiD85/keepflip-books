@@ -45,7 +45,7 @@ test('legacy active eBay connection rows remain eligible for their deterministic
   );
 });
 
-test('overview sends Appwrite Cloud-compatible JSON query objects', async () => {
+test('overview sends Appwrite query strings', async () => {
   const environmentNames = [
     'APPWRITE_BOOKS_DATABASE_ID',
     'APPWRITE_BOOK_JOURNAL_LINES_TABLE_ID',
@@ -77,20 +77,11 @@ test('overview sends Appwrite Cloud-compatible JSON query objects', async () => 
           requestUrl.pathname,
           '/v1/tablesdb/keepflip/tables/book_journal_lines/rows',
         );
-        assert.deepEqual(
-          requestUrl.searchParams
-            .getAll('queries[]')
-            .map((query) => JSON.parse(query)),
-          [
-            {
-              attribute: 'ownerId',
-              method: 'equal',
-              values: ['user-1'],
-            },
-            { attribute: 'occurredAt', method: 'orderDesc' },
-            { method: 'limit', values: [1000] },
-          ],
-        );
+        assert.deepEqual(requestUrl.searchParams.getAll('queries[]'), [
+          'equal("ownerId",["user-1"])',
+          'orderDesc("occurredAt")',
+          'limit(1000)',
+        ]);
         return jsonResponse({ rows: [] });
       },
     });
@@ -122,6 +113,69 @@ test('overview sends Appwrite Cloud-compatible JSON query objects', async () => 
       ok: true,
       truncated: false,
     });
+  } finally {
+    restoreEnvironment(previous);
+  }
+});
+
+test('maps an Appwrite overview failure to an upstream 502 instead of a generic 500', async () => {
+  const environmentNames = [
+    'APPWRITE_BOOKS_DATABASE_ID',
+    'APPWRITE_BOOK_JOURNAL_LINES_TABLE_ID',
+    'APPWRITE_FUNCTION_API_ENDPOINT',
+    'APPWRITE_FUNCTION_PROJECT_ID',
+  ];
+  const previous = Object.fromEntries(
+    environmentNames.map((name) => [name, process.env[name]]),
+  );
+  Object.assign(process.env, {
+    APPWRITE_BOOKS_DATABASE_ID: 'keepflip',
+    APPWRITE_BOOK_JOURNAL_LINES_TABLE_ID: 'book_journal_lines',
+    APPWRITE_FUNCTION_API_ENDPOINT: 'https://appwrite.example/v1',
+    APPWRITE_FUNCTION_PROJECT_ID: 'keepflip',
+  });
+
+  try {
+    const logs = [];
+    const handler = createHandler({
+      fetchImpl: async (url) => {
+        const requestUrl = new URL(url);
+        if (requestUrl.pathname === '/v1/account') {
+          return jsonResponse({ $id: 'user-1' });
+        }
+        return jsonResponse({ message: 'Invalid query.' }, 400);
+      },
+    });
+    const result = { body: null, status: null };
+    const res = {
+      json(body, status = 200) {
+        result.body = body;
+        result.status = status;
+        return body;
+      },
+    };
+
+    await handler({
+      log: (message) => logs.push(message),
+      req: {
+        headers: {
+          'x-appwrite-key': 'function-key',
+          'x-appwrite-user-jwt': 'user-jwt',
+        },
+        method: 'POST',
+        path: '/overview',
+      },
+      res,
+    });
+
+    assert.equal(result.status, 502);
+    assert.deepEqual(result.body, {
+      error: 'KeepFlip could not update Books. Please try again.',
+      ok: false,
+    });
+    assert.deepEqual(logs, [
+      'KeepFlip Books POST /overview failed with status 502. reason=APPWRITE_400',
+    ]);
   } finally {
     restoreEnvironment(previous);
   }

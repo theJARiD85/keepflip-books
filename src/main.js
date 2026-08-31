@@ -214,11 +214,19 @@ function rowPath(configuration, tableId, rowId) {
 }
 
 function createQuery(method, attribute = '', values = []) {
-  return JSON.stringify({
-    ...(attribute ? { attribute } : {}),
-    method,
-    ...(values.length ? { values } : {}),
-  });
+  const args = [];
+  const queryAttribute = text(attribute, 512);
+
+  if (queryAttribute) args.push(JSON.stringify(queryAttribute));
+  if (Array.isArray(values) && values.length) {
+    args.push(
+      JSON.stringify(
+        queryAttribute || values.length !== 1 ? values : values[0],
+      ),
+    );
+  }
+
+  return `${text(method, 64)}(${args.join(',')})`;
 }
 
 function listRowsPath(configuration, tableId, queries) {
@@ -1269,13 +1277,25 @@ async function handleOverview({ req, res, runtime, fetchImpl }) {
   });
 }
 
+function responseStatus(error) {
+  if (error instanceof HttpError) return error.status;
+  if (error instanceof UpstreamError) return 502;
+  return 500;
+}
+
 function safeError(log, error, method, path) {
-  const status = error instanceof HttpError ? error.status : 500;
-  log(`KeepFlip Books ${method} ${path} failed with status ${status}.`);
+  const status = responseStatus(error);
+  const reason =
+    error instanceof HttpError
+      ? `HTTP_${error.status}`
+      : error instanceof UpstreamError
+        ? `APPWRITE_${error.status || 'NETWORK'}`
+        : `UNEXPECTED_${text(error?.name, 32).toUpperCase() || 'ERROR'}`;
+  log(`KeepFlip Books ${method} ${path} failed with status ${status}. reason=${reason}`);
 }
 
 function jsonError(res, error) {
-  const status = error instanceof HttpError ? error.status : 500;
+  const status = responseStatus(error);
   const message =
     error instanceof HttpError
       ? error.message
