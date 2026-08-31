@@ -1283,7 +1283,7 @@ function jsonError(res, error) {
   return res.json({ error: message, ok: false }, status);
 }
 
-export function createHandler({ fetchImpl = fetch, now = () => new Date().toISOString() } = {}) {
+export function createHandler({ error, log, fetchImpl = fetch, now = () => new Date().toISOString() } = {}) {
   return async ({ req, res, log = () => {} }) => {
     const method = text(req?.method, 16).toUpperCase();
     const path = requestPath(req);
@@ -1300,8 +1300,9 @@ export function createHandler({ fetchImpl = fetch, now = () => new Date().toISOS
       if (path === '/overview') {
         return await handleOverview({ fetchImpl, req, res, runtime });
       }
-      throw new HttpError(404, 'Books endpoint not found.');
+      error(404, 'Books endpoint not found.');
     } catch (error) {
+      error(error);
       safeError(log, error, method, path);
       return jsonError(res, error);
     }
