@@ -214,19 +214,15 @@ function rowPath(configuration, tableId, rowId) {
 }
 
 function createQuery(method, attribute = '', values = []) {
-  const args = [];
+  const query = { method: text(method, 64) };
   const queryAttribute = text(attribute, 512);
 
-  if (queryAttribute) args.push(JSON.stringify(queryAttribute));
+  if (queryAttribute) query.attribute = queryAttribute;
   if (Array.isArray(values) && values.length) {
-    args.push(
-      JSON.stringify(
-        queryAttribute || values.length !== 1 ? values : values[0],
-      ),
-    );
+    query.values = values;
   }
 
-  return `${text(method, 64)}(${args.join(',')})`;
+  return JSON.stringify(query);
 }
 
 function listRowsPath(configuration, tableId, queries) {

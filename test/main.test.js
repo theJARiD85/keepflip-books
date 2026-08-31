@@ -45,7 +45,7 @@ test('legacy active eBay connection rows remain eligible for their deterministic
   );
 });
 
-test('overview sends Appwrite query strings', async () => {
+test('overview sends Appwrite TablesDB JSON query objects', async () => {
   const environmentNames = [
     'APPWRITE_BOOKS_DATABASE_ID',
     'APPWRITE_BOOK_JOURNAL_LINES_TABLE_ID',
@@ -77,10 +77,10 @@ test('overview sends Appwrite query strings', async () => {
           requestUrl.pathname,
           '/v1/tablesdb/keepflip/tables/book_journal_lines/rows',
         );
-        assert.deepEqual(requestUrl.searchParams.getAll('queries[]'), [
-          'equal("ownerId",["user-1"])',
-          'orderDesc("occurredAt")',
-          'limit(1000)',
+        assert.deepEqual(requestUrl.searchParams.getAll('queries[]').map(JSON.parse), [
+          { attribute: 'ownerId', method: 'equal', values: ['user-1'] },
+          { attribute: 'occurredAt', method: 'orderDesc' },
+          { method: 'limit', values: [1000] },
         ]);
         return jsonResponse({ rows: [] });
       },
