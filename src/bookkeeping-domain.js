@@ -6,6 +6,8 @@
  * through this boundary.
  */
 
+import { createHash } from 'node:crypto';
+
 export const BOOK_ACCOUNT = Object.freeze({
   cash: 'cash_on_hand',
   marketplaceClearing: 'marketplace_clearing',
@@ -36,6 +38,29 @@ export class BookkeepingValidationError extends Error {
 function text(value, maximum = 240) {
   if (typeof value !== 'string') return '';
   return value.trim().slice(0, maximum);
+}
+
+function reviewOccurredAt(value) {
+  const date = new Date(text(value, 80));
+  return Number.isFinite(date.getTime())
+    ? date.toISOString()
+    : '1970-01-01T00:00:00.000Z';
+}
+
+function invalidEbayExternalId(source, kind) {
+  const safeIdentity = {
+    kind,
+    payoutDate: text(source?.payoutDate, 64),
+    payoutId: text(source?.payoutId, 180),
+    transactionDate: text(source?.transactionDate, 64),
+    transactionId: text(source?.transactionId, 180),
+    transactionType: text(source?.transactionType, 80).toUpperCase(),
+  };
+  const digest = createHash('sha256')
+    .update(JSON.stringify(safeIdentity), 'utf8')
+    .digest('hex')
+    .slice(0, 24);
+  return `invalid-${kind}-${digest}`;
 }
 
 export function assertCents(value, label = 'Amount') {
@@ -436,13 +461,23 @@ function identifiersFromEbayTransaction(raw) {
  * Converts a raw eBay Finances transaction into a no-PII posting request.
  * Unknown or insufficient data is returned as a review item, not guessed.
  */
-export function parseEbayFinanceTransaction(raw) {
+export function parseEbayFinanceTransaction(raw, options = {}) {
   const source = raw && typeof raw === 'object' ? raw : {};
   const transactionType = text(source.transactionType, 80).toUpperCase();
   const transactionId = text(source.transactionId, 180);
   const occurredAt = text(source.transactionDate, 64);
   if (!transactionType || !transactionId || !occurredAt) {
-    throw new BookkeepingValidationError('eBay transaction is missing its identity or date.');
+    const externalId = invalidEbayExternalId(source, 'transaction');
+    return {
+      eventType: null,
+      externalId,
+      itemIdentifiers: [],
+      occurredAt: occurredAt || reviewOccurredAt(options?.fallbackOccurredAt),
+      orderId: text(source.orderId, 180) || null,
+      reviewReason: 'eBay transaction is missing its identity or date.',
+      sourceKey: `ebay:invalid:${externalId}`,
+      status: 'needs_review',
+    };
   }
 
   const sourceKey = `ebay:${transactionType}:${transactionId}`;
@@ -530,13 +565,21 @@ export function parseEbayFinanceTransaction(raw) {
   }
 }
 
-export function parseEbayPayout(raw) {
+export function parseEbayPayout(raw, options = {}) {
   const source = raw && typeof raw === 'object' ? raw : {};
   const payoutId = text(source.payoutId, 180);
   const occurredAt =
     text(source.payoutDate, 64) || text(source.transactionDate, 64);
   if (!payoutId || !occurredAt) {
-    throw new BookkeepingValidationError('eBay payout is missing its identity or date.');
+    const externalId = invalidEbayExternalId(source, 'payout');
+    return {
+      eventType: null,
+      externalId,
+      occurredAt: occurredAt || reviewOccurredAt(options?.fallbackOccurredAt),
+      reviewReason: 'eBay payout is missing its identity or date.',
+      sourceKey: `ebay:invalid:${externalId}`,
+      status: 'needs_review',
+    };
   }
   try {
     const amount = firstMoney(source, ['amount'], 'eBay payout');

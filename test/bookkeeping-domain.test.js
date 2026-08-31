@@ -157,6 +157,32 @@ test('eBay fee and payout parsing never converts decimal money through floats', 
   assert.equal(payout.amountCents, 9_999);
 });
 
+test('an eBay transaction without an identity is held for review instead of aborting sync', () => {
+  const parsed = parseEbayFinanceTransaction(
+    { transactionType: 'SALE' },
+    { fallbackOccurredAt: '2026-08-31T22:00:00.000Z' },
+  );
+
+  assert.equal(parsed.status, 'needs_review');
+  assert.equal(parsed.eventType, null);
+  assert.equal(parsed.occurredAt, '2026-08-31T22:00:00.000Z');
+  assert.match(parsed.externalId, /^invalid-transaction-[a-f0-9]{24}$/);
+  assert.equal(parsed.reviewReason, 'eBay transaction is missing its identity or date.');
+});
+
+test('an eBay payout without an identity is held for review instead of aborting sync', () => {
+  const parsed = parseEbayPayout(
+    {},
+    { fallbackOccurredAt: '2026-08-31T22:00:00.000Z' },
+  );
+
+  assert.equal(parsed.status, 'needs_review');
+  assert.equal(parsed.eventType, null);
+  assert.equal(parsed.occurredAt, '2026-08-31T22:00:00.000Z');
+  assert.match(parsed.externalId, /^invalid-payout-[a-f0-9]{24}$/);
+  assert.equal(parsed.reviewReason, 'eBay payout is missing its identity or date.');
+});
+
 test('a multi-item eBay sale is held for review instead of assigning all COGS to one item', () => {
   const parsed = parseEbayFinanceTransaction({
     orderLineItems: [{ lineItemId: 'one' }, { lineItemId: 'two' }],

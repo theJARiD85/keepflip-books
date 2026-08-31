@@ -1104,13 +1104,40 @@ async function handleParsedEbayEvent({ runtime, configuration, apiKey, ownerId, 
     };
   }
 
-  const entry = postBookkeepingEvent({
-    ...event,
-    costCents,
-    itemId,
-    notes: null,
-    sourceKey: `ebay_finances:${event.externalId}`,
-  });
+  let entry;
+  try {
+    entry = postBookkeepingEvent({
+      ...event,
+      costCents,
+      itemId,
+      notes: null,
+      sourceKey: `ebay_finances:${event.externalId}`,
+    });
+  } catch (caught) {
+    if (!(caught instanceof BookkeepingValidationError)) throw caught;
+    await recordReviewEvent({
+      apiKey,
+      configuration,
+      event: {
+        ...event,
+        amountCents:
+          Number.isSafeInteger(event.amountCents)
+            ? event.amountCents
+            : Number.isSafeInteger(event.grossSaleCents)
+              ? event.grossSaleCents
+              : 0,
+        externalKey: event.externalId || event.sourceKey,
+        source: 'ebay_finances',
+      },
+      fetchImpl,
+      now,
+      ownerId,
+      reason: 'The eBay event could not be posted safely.',
+      runtime,
+      status: 'needs_review',
+    });
+    return 'needs_review';
+  }
   const result = await persistEntry({
     apiKey,
     configuration,
@@ -1175,7 +1202,9 @@ async function handleEbaySync({ req, res, runtime, fetchImpl, now }) {
   ]);
   const counts = { alreadyRecorded: 0, needsItemCost: 0, needsItemMatch: 0, needsReview: 0, posted: 0 };
   for (const raw of transactions) {
-    const parsed = parseEbayFinanceTransaction(raw);
+    const parsed = parseEbayFinanceTransaction(raw, {
+      fallbackOccurredAt: now,
+    });
     const outcome = await handleParsedEbayEvent({
       apiKey,
       configuration,
@@ -1192,7 +1221,7 @@ async function handleEbaySync({ req, res, runtime, fetchImpl, now }) {
     else counts.posted += 1;
   }
   for (const raw of payouts) {
-    const parsed = parseEbayPayout(raw);
+    const parsed = parseEbayPayout(raw, { fallbackOccurredAt: now });
     parsed.payoutStatus = text(raw?.payoutStatus, 60) || 'unknown';
     const outcome = await handleParsedEbayEvent({
       apiKey,
@@ -1279,6 +1308,7 @@ async function handleOverview({ req, res, runtime, fetchImpl }) {
 
 function responseStatus(error) {
   if (error instanceof HttpError) return error.status;
+  if (error instanceof BookkeepingValidationError) return 422;
   if (error instanceof UpstreamError) return 502;
   return 500;
 }
@@ -1288,6 +1318,8 @@ function safeError(log, error, method, path) {
   const reason =
     error instanceof HttpError
       ? `HTTP_${error.status}`
+      : error instanceof BookkeepingValidationError
+        ? 'BOOKKEEPING_VALIDATION'
       : error instanceof UpstreamError
         ? `APPWRITE_${error.status || 'NETWORK'}`
         : `UNEXPECTED_${text(error?.name, 32).toUpperCase() || 'ERROR'}`;
@@ -1299,6 +1331,8 @@ function jsonError(res, error) {
   const message =
     error instanceof HttpError
       ? error.message
+      : error instanceof BookkeepingValidationError
+        ? 'One or more bookkeeping events need review.'
       : 'KeepFlip could not update Books. Please try again.';
   return res.json({ error: message, ok: false }, status);
 }
