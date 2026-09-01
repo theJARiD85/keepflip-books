@@ -15,6 +15,7 @@ import {
 
 const MAX_EBAY_SYNC_DAYS = 90;
 const MAX_EBAY_SYNC_ROWS = 500;
+const MAX_INVENTORY_QUANTITY = 100_000;
 const EBAY_SCOPES = Object.freeze([
   'https://api.ebay.com/oauth/api_scope',
   'https://api.ebay.com/oauth/api_scope/commerce.identity.readonly',
@@ -311,6 +312,114 @@ function optionalIntegerCents(value, field) {
 
 function ownerIdFromRow(row) {
   return text(row?.ownerId, 64);
+}
+
+function storedInventoryQuantity(value, field, fallback = 1) {
+  if (value == null || value === '') return fallback;
+  const quantity = Number(value);
+  if (
+    !Number.isSafeInteger(quantity) ||
+    quantity < 0 ||
+    quantity > MAX_INVENTORY_QUANTITY
+  ) {
+    throw new HttpError(
+      400,
+      `${field} must be a whole number from 0 through ${MAX_INVENTORY_QUANTITY.toLocaleString()}.`,
+    );
+  }
+  return quantity;
+}
+
+function saleQuantity(value) {
+  if (value == null || value === '') return 1;
+  const quantity = Number(value);
+  if (
+    !Number.isSafeInteger(quantity) ||
+    quantity < 1 ||
+    quantity > MAX_INVENTORY_QUANTITY
+  ) {
+    throw new HttpError(
+      400,
+      `Quantity sold must be a whole number from 1 through ${MAX_INVENTORY_QUANTITY.toLocaleString()}.`,
+    );
+  }
+  return quantity;
+}
+
+/**
+ * Apportions a saved lot's remaining cost in whole cents. Partial sales round
+ * down; the final unit receives any remainder so total COGS always equals the
+ * original cost of the lot exactly.
+ */
+export function inventorySaleState(item, requestedQuantity = 1) {
+  const quantityBefore = storedInventoryQuantity(
+    item?.quantityOnHand,
+    'Stored item quantity',
+  );
+  if (quantityBefore < 1) {
+    throw new HttpError(400, 'This inventory item has no units left to sell.');
+  }
+
+  const quantity = saleQuantity(requestedQuantity);
+  if (quantity > quantityBefore) {
+    throw new HttpError(
+      400,
+      `Only ${quantityBefore.toLocaleString()} unit${quantityBefore === 1 ? '' : 's'} remain for this item.`,
+    );
+  }
+
+  const savedOnHandCost = optionalIntegerCents(
+    item?.inventoryCostCentsOnHand,
+    'Stored inventory cost',
+  );
+  const savedOriginalCost = optionalIntegerCents(
+    item?.acquisitionCostCents,
+    'Stored item cost',
+  );
+  const costBefore =
+    savedOnHandCost === undefined ? savedOriginalCost : savedOnHandCost;
+  const costCents =
+    costBefore === undefined
+      ? null
+      : quantity === quantityBefore
+        ? costBefore
+        : Math.floor((costBefore * quantity) / quantityBefore);
+
+  return {
+    costCents,
+    inventoryCostCentsOnHand:
+      costBefore === undefined ? null : costBefore - (costCents ?? 0),
+    quantityBefore,
+    quantityOnHand: quantityBefore - quantity,
+  };
+}
+
+function itemUpdateForSale({
+  externalKey,
+  occurredAt,
+  orderId,
+  ownerId,
+  sale,
+  source,
+  now,
+}) {
+  const update = {
+    bookSaleTransactionId: transactionRowId(ownerId, source, externalKey),
+    inventoryCostCentsOnHand: sale.inventoryCostCentsOnHand,
+    quantityOnHand: sale.quantityOnHand,
+    updatedAt: now,
+  };
+
+  if (sale.quantityOnHand === 0) {
+    return {
+      ...update,
+      resaleStatus: 'sold',
+      soldAt: occurredAt,
+      soldOrderId: orderId || null,
+    };
+  }
+
+  return update;
 }
 
 async function getRowOrNull({ runtime, configuration, tableId, rowId, apiKey, fetchImpl }) {
@@ -724,9 +833,9 @@ async function handleManualRecord({ req, res, runtime, fetchImpl, now }) {
         ownerId,
         runtime,
       });
-      const costCents = optionalIntegerCents(item.acquisitionCostCents, 'Stored item cost');
+      const sale = inventorySaleState(item, body.quantity);
       entry = postBookkeepingEvent({
-        costCents: costCents && costCents > 0 ? costCents : null,
+        costCents: sale.costCents,
         currency: 'USD',
         eventType,
         feeCents: optionalIntegerCents(body.feeCents, 'Marketplace fees') ?? 0,
@@ -738,13 +847,15 @@ async function handleManualRecord({ req, res, runtime, fetchImpl, now }) {
         sourceKey: `${source}:${eventType}:${externalKey}`,
         summary: 'Manual sale',
       });
-      itemUpdate = {
-        bookSaleTransactionId: transactionRowId(ownerId, source, externalKey),
-        resaleStatus: 'sold',
-        soldAt: occurredAt,
-        soldOrderId: text(body.orderId, 180) || null,
-        updatedAt: now,
-      };
+      itemUpdate = itemUpdateForSale({
+        externalKey,
+        occurredAt,
+        orderId: text(body.orderId, 180) || null,
+        ownerId,
+        sale,
+        source,
+        now,
+      });
     } else {
       const amountCents = integerCents(body.amountCents);
       if (eventType === 'inventory_purchase' && !itemId) {
@@ -1088,16 +1199,37 @@ async function handleParsedEbayEvent({ runtime, configuration, apiKey, ownerId, 
       });
       return 'needs_item_match';
     }
+    const sale = inventorySaleState(item, 1);
+    if (sale.quantityBefore > 1) {
+      await recordReviewEvent({
+        apiKey,
+        configuration,
+        event: {
+          ...event,
+          amountCents: event.grossSaleCents,
+          externalKey: event.externalId,
+          source: 'ebay_finances',
+        },
+        fetchImpl,
+        now,
+        ownerId,
+        reason: 'This inventory item has multiple units. Confirm the sold quantity before moving cost out of inventory.',
+        runtime,
+        status: 'needs_review',
+      });
+      return 'needs_review';
+    }
     itemId = text(item.$id, 64);
-    const storedCost = Number(item.acquisitionCostCents);
-    costCents = Number.isSafeInteger(storedCost) && storedCost > 0 ? storedCost : null;
-    itemUpdate = {
-      bookSaleTransactionId: transactionRowId(ownerId, 'ebay_finances', event.externalId),
-      resaleStatus: 'sold',
-      soldAt: event.occurredAt,
-      soldOrderId: event.orderId || null,
-      updatedAt: now,
-    };
+    costCents = sale.costCents;
+    itemUpdate = itemUpdateForSale({
+      externalKey: event.externalId,
+      occurredAt: event.occurredAt,
+      orderId: event.orderId || null,
+      ownerId,
+      sale,
+      source: 'ebay_finances',
+      now,
+    });
   }
 
   let entry;

@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createHandler, isSyncEligibleEbayConnection } from '../src/main.js';
+import {
+  createHandler,
+  inventorySaleState,
+  isSyncEligibleEbayConnection,
+} from '../src/main.js';
 
 function jsonResponse(payload, status = 200) {
   return {
@@ -179,4 +183,48 @@ test('maps an Appwrite overview failure to an upstream 502 instead of a generic 
   } finally {
     restoreEnvironment(previous);
   }
+});
+
+test('a partial lot sale carries only its share of cost and the last unit gets the remainder', () => {
+  const firstSale = inventorySaleState(
+    { acquisitionCostCents: 1_001, quantityOnHand: 3 },
+    1,
+  );
+  const secondSale = inventorySaleState(
+    {
+      inventoryCostCentsOnHand: firstSale.inventoryCostCentsOnHand,
+      quantityOnHand: firstSale.quantityOnHand,
+    },
+    1,
+  );
+  const finalSale = inventorySaleState(
+    {
+      inventoryCostCentsOnHand: secondSale.inventoryCostCentsOnHand,
+      quantityOnHand: secondSale.quantityOnHand,
+    },
+    1,
+  );
+
+  assert.deepEqual(firstSale, {
+    costCents: 333,
+    inventoryCostCentsOnHand: 668,
+    quantityBefore: 3,
+    quantityOnHand: 2,
+  });
+  assert.deepEqual(secondSale, {
+    costCents: 334,
+    inventoryCostCentsOnHand: 334,
+    quantityBefore: 2,
+    quantityOnHand: 1,
+  });
+  assert.deepEqual(finalSale, {
+    costCents: 334,
+    inventoryCostCentsOnHand: 0,
+    quantityBefore: 1,
+    quantityOnHand: 0,
+  });
+  assert.equal(
+    firstSale.costCents + secondSale.costCents + finalSale.costCents,
+    1_001,
+  );
 });

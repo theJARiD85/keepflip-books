@@ -246,8 +246,8 @@ export function postSale(input) {
   if (!Number.isSafeInteger(taxCents) || taxCents < 0) {
     throw new BookkeepingValidationError('Marketplace-collected tax must be whole cents.');
   }
-  if (costCents != null && (!Number.isSafeInteger(costCents) || costCents <= 0)) {
-    throw new BookkeepingValidationError('Item cost must be positive whole cents.');
+  if (costCents != null && (!Number.isSafeInteger(costCents) || costCents < 0)) {
+    throw new BookkeepingValidationError('Item cost must be whole cents.');
   }
 
   const lines = [
@@ -280,7 +280,7 @@ export function postSale(input) {
     );
   }
 
-  if (costCents != null) {
+  if (costCents != null && costCents > 0) {
     lines.push(
       debit(BOOK_ACCOUNT.costOfGoodsSold, costCents, 'Original item cost'),
       credit(BOOK_ACCOUNT.inventory, costCents, 'Item moved out of inventory'),

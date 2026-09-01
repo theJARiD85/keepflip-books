@@ -217,3 +217,20 @@ test('a reviewed eBay source event is promoted instead of creating a duplicate',
   assert.equal(operation.data.eventStatus, 'posted');
   assert.equal(operation.rowId, 'source-event-1');
 });
+
+test('a known zero-cost sale is not treated as missing cost', () => {
+  const entry = postSale({
+    costCents: 0,
+    grossSaleCents: 5_000,
+    occurredAt: '2026-09-01T12:00:00.000Z',
+    sourceKey: 'manual:sale:zero-cost-item',
+  });
+
+  assert.equal(entry.grossProfitCents, 5_000);
+  assert.equal(entry.needsCostReview, false);
+  assert.equal(
+    entry.lines.some((line) => line.accountCode === BOOK_ACCOUNT.costOfGoodsSold),
+    false,
+  );
+  assertBalancedJournal(entry.lines);
+});
