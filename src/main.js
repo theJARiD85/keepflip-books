@@ -465,7 +465,6 @@ async function mapWithConcurrency(items, concurrency, worker) {
 }
 
 async function auditAndRepair({
-  req,
   runtime,
   configuration,
   apiKey,
@@ -573,6 +572,40 @@ async function auditAndRepair({
   };
 }
 
+async function enrichReviewList({ req, coreBody, fetchImpl }) {
+  const runtime = runtimeConfiguration();
+  const configuration = tableConfiguration();
+  const apiKey = dynamicApiKey(req);
+  const ownerId = await authenticatedUserId({ fetchImpl, req, runtime });
+  const rows = await listSourceEvents({
+    apiKey,
+    configuration,
+    fetchImpl,
+    ownerId,
+    runtime,
+  });
+  const byId = new Map(rows.map((row) => [text(row?.$id, 64), row]));
+  const items = Array.isArray(coreBody?.items) ? coreBody.items : [];
+
+  return {
+    ...coreBody,
+    items: items.map((item) => {
+      const row = byId.get(text(item?.id, 64));
+      if (!row) return item;
+      return {
+        ...item,
+        bookingEntry: text(row?.bookingEntry, 32) || null,
+        rawAmountValue: text(row?.rawAmountValue, 64) || null,
+        rawCurrency: text(row?.rawCurrency, 8).toUpperCase() || null,
+        rawTransactionType: text(row?.rawTransactionType, 80).toUpperCase() || null,
+        reason: text(row?.reviewReason, 1_000) || item.reason,
+        reviewUpdatedAt: text(row?.reviewUpdatedAt, 80) || null,
+        transactionMemo: text(row?.transactionMemo, 1_000) || null,
+      };
+    }),
+  };
+}
+
 function captureResponse() {
   const result = { body: null, status: 200 };
   return {
@@ -613,6 +646,29 @@ export function createHandler(options = {}) {
   return async (context) => {
     const method = text(context?.req?.method, 16).toUpperCase();
     const path = requestPath(context?.req);
+
+    if (method === 'POST' && path === '/review/list') {
+      const core = await invokeCore(coreHandler, context);
+      if (core.status !== 200 || core.body?.ok !== true) {
+        return context.res.json(core.body, core.status);
+      }
+      try {
+        const enriched = await enrichReviewList({
+          coreBody: core.body,
+          fetchImpl,
+          req: context.req,
+        });
+        return context.res.json(enriched, core.status);
+      } catch (error) {
+        context?.log?.(
+          `[KeepFlip Books] Review audit detail enrichment deferred: ${
+            error instanceof Error ? error.message : 'unknown error'
+          }`,
+        );
+        return context.res.json(core.body, core.status);
+      }
+    }
+
     if (method !== 'POST' || path !== '/ebay/sync') {
       return coreHandler(context);
     }
@@ -635,7 +691,7 @@ export function createHandler(options = {}) {
         runtime,
       });
 
-      let rows = await listSourceEvents({
+      const rows = await listSourceEvents({
         apiKey,
         configuration,
         fetchImpl,
@@ -687,7 +743,6 @@ export function createHandler(options = {}) {
         initialLegacyIds,
         now,
         ownerId,
-        req: context.req,
         runtime,
         start: auditStart,
       });
