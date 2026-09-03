@@ -317,3 +317,108 @@ test('configured Books entrypoint serves the focused review detail route', async
     restoreEnvironment(previous);
   }
 });
+
+
+test('review confirm falls back safely when eventStatus rejects review_confirmed', async () => {
+  const environmentNames = [
+    'APPWRITE_BOOKS_DATABASE_ID',
+    'APPWRITE_BOOK_SOURCE_EVENTS_TABLE_ID',
+    'APPWRITE_FUNCTION_API_ENDPOINT',
+    'APPWRITE_FUNCTION_PROJECT_ID',
+  ];
+  const previous = Object.fromEntries(
+    environmentNames.map((name) => [name, process.env[name]]),
+  );
+  Object.assign(process.env, {
+    APPWRITE_BOOKS_DATABASE_ID: 'keepflip',
+    APPWRITE_BOOK_SOURCE_EVENTS_TABLE_ID: 'book_source_events',
+    APPWRITE_FUNCTION_API_ENDPOINT: 'https://appwrite.example/v1',
+    APPWRITE_FUNCTION_PROJECT_ID: 'keepflip',
+  });
+
+  try {
+    const patches = [];
+    const handler = createHandler({
+      fetchImpl: async (url, init = {}) => {
+        const requestUrl = new URL(url);
+        if (requestUrl.pathname === '/v1/account') {
+          return jsonResponse({ $id: 'user-1' });
+        }
+        if (
+          requestUrl.pathname ===
+          '/v1/tablesdb/keepflip/tables/book_source_events/rows/review-1'
+        ) {
+          if ((init.method || 'GET') === 'PATCH') {
+            const body = JSON.parse(init.body || '{}');
+            patches.push(body.data);
+            if (body.data?.eventStatus === 'review_confirmed') {
+              return jsonResponse(
+                { message: 'eventStatus contains an invalid enum value.' },
+                400,
+              );
+            }
+            return jsonResponse({ $id: 'review-1', ...body.data });
+          }
+          return jsonResponse({
+            $id: 'review-1',
+            amountCents: 1919,
+            currency: 'GBP',
+            eventStatus: 'needs_review',
+            externalKey: 'ebay-transaction-1',
+            occurredAt: '2026-08-22T12:00:00.000Z',
+            ownerId: 'user-1',
+            reviewReason: 'Confirm this marketplace credit.',
+            source: 'ebay_finances',
+            sourceType: 'marketplace_credit_foreign_currency',
+          });
+        }
+        return jsonResponse({ message: 'Not found.' }, 404);
+      },
+    });
+
+    const result = { body: null, status: null };
+    const res = {
+      json(body, status = 200) {
+        result.body = body;
+        result.status = status;
+        return body;
+      },
+    };
+
+    await handler({
+      req: {
+        bodyJson: {
+          amountCents: 1919,
+          currency: 'GBP',
+          reviewId: 'review-1',
+          transactionMemo: null,
+        },
+        headers: {
+          'x-appwrite-key': 'function-key',
+          'x-appwrite-user-jwt': 'user-jwt',
+        },
+        method: 'POST',
+        path: '/review/confirm',
+      },
+      res,
+    });
+
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.body, {
+      alreadyConfirmed: false,
+      amountCents: 1919,
+      currency: 'GBP',
+      ok: true,
+      status: 'review_confirmed',
+    });
+    assert.equal(patches.length, 2);
+    assert.equal(patches[0].eventStatus, 'review_confirmed');
+    assert.equal(patches[1].eventStatus, 'needs_review');
+    assert.match(
+      patches[1].reviewReason,
+      /^\[KEEPFLIP_REVIEW_CONFIRMED\]/,
+    );
+  } finally {
+    restoreEnvironment(previous);
+  }
+});
