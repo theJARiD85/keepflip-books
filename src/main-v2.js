@@ -11,6 +11,7 @@ const OPEN_REVIEW_STATUSES = new Set([
   'needs_item_cost',
   'needs_review',
 ]);
+const CONFIRMED_REVIEW_PREFIX = '[KEEPFLIP_REVIEW_CONFIRMED]';
 
 class ReviewHttpError extends Error {
   constructor(status, message) {
@@ -21,10 +22,11 @@ class ReviewHttpError extends Error {
 }
 
 class ReviewUpstreamError extends Error {
-  constructor(status, message) {
+  constructor(status, message, upstreamMessage = '') {
     super(message);
     this.name = 'ReviewUpstreamError';
     this.status = status;
+    this.upstreamMessage = text(upstreamMessage, 1_000);
   }
 }
 
@@ -135,7 +137,13 @@ async function appwriteJson({
     throw new ReviewUpstreamError(0, failureMessage);
   }
   const payload = await responseJson(response);
-  if (!response.ok) throw new ReviewUpstreamError(response.status, failureMessage);
+  if (!response.ok) {
+    throw new ReviewUpstreamError(
+      response.status,
+      failureMessage,
+      text(payload?.message, 1_000) || text(payload?.error, 1_000),
+    );
+  }
   return payload;
 }
 
@@ -236,11 +244,35 @@ function normalizedCurrency(value, fallback = '') {
   return currency;
 }
 
+function storedReviewReason(row) {
+  const reason = text(row?.reviewReason, 1_000);
+  return reason.startsWith(CONFIRMED_REVIEW_PREFIX)
+    ? reason.slice(CONFIRMED_REVIEW_PREFIX.length).trim()
+    : reason;
+}
+
+function isFallbackConfirmedReviewRow(row) {
+  return Boolean(
+    text(row?.reviewUpdatedAt, 80) &&
+      text(row?.reviewReason, 1_000).startsWith(CONFIRMED_REVIEW_PREFIX),
+  );
+}
+
+function fallbackConfirmedReviewReason(row) {
+  const reason =
+    storedReviewReason(row) ||
+    reviewItemForRow(row).reason ||
+    'Source transaction reviewed and confirmed by the user in Books.';
+  return `${CONFIRMED_REVIEW_PREFIX} ${reason}`.slice(0, 1_000);
+}
+
 function reviewDetailForRow(row, item = null) {
   const base = reviewItemForRow(row);
-  const storedReason = text(row?.reviewReason, 1_000);
+  const storedReason = storedReviewReason(row);
+  const fallbackConfirmed = isFallbackConfirmedReviewRow(row);
   return {
     ...base,
+    status: fallbackConfirmed ? 'review_confirmed' : base.status,
     bookingEntry: text(row?.bookingEntry, 32).toUpperCase() || null,
     rawAmountValue: text(row?.rawAmountValue, 64) || null,
     rawCurrency: text(row?.rawCurrency, 8).toUpperCase() || null,
@@ -296,6 +328,41 @@ async function loadReviewItem({ runtime, configuration, apiKey, ownerId, reviewR
     tableId: configuration.itemsTableId,
   });
   return item && ownerIdFromRow(item) === ownerId ? item : null;
+}
+
+async function handleReviewList({ req, res, runtime, fetchImpl }) {
+  const ownerId = await authenticatedUserId({ fetchImpl, req, runtime });
+  const apiKey = dynamicApiKey(req);
+  const configuration = tableConfiguration();
+  const payload = await appwriteJson({
+    apiKey,
+    failureMessage: 'KeepFlip could not load the money review queue.',
+    fetchImpl,
+    path: listRowsPath(configuration, configuration.sourceEventsTableId, [
+      createQuery('equal', 'ownerId', [ownerId]),
+      createQuery('limit', '', [500]),
+    ]),
+    runtime,
+  });
+  const rows = Array.isArray(payload?.rows) ? payload.rows : [];
+  const items = rows
+    .filter(
+      (row) =>
+        OPEN_REVIEW_STATUSES.has(text(row?.eventStatus, 40)) &&
+        !isFallbackConfirmedReviewRow(row),
+    )
+    .sort((left, right) => {
+      const leftTime = Date.parse(text(left?.occurredAt, 64)) || 0;
+      const rightTime = Date.parse(text(right?.occurredAt, 64)) || 0;
+      return rightTime - leftTime;
+    })
+    .map((row) => reviewDetailForRow(row));
+
+  return res.json({
+    items,
+    ok: true,
+    total: items.length,
+  });
 }
 
 async function handleReviewDetail({ req, res, runtime, fetchImpl }) {
@@ -611,26 +678,58 @@ async function confirmGeneralReview({ loaded, runtime, fetchImpl, now }) {
   const amountCents = nonNegativeCents(body.amountCents, 'Reviewed amount');
   const currency = normalizedCurrency(body.currency, reviewRow.currency);
   const transactionMemo = text(body.transactionMemo, 1_000) || null;
-  await appwriteJson({
-    apiKey,
-    body: {
-      data: {
-        amountCents,
-        currency,
-        eventStatus: 'review_confirmed',
-        reviewReason:
-          text(reviewRow.reviewReason, 850) ||
-          'Source transaction reviewed and confirmed by the user in Books.',
-        reviewUpdatedAt: now,
-        transactionMemo,
+  const reviewReason =
+    storedReviewReason(reviewRow) ||
+    'Source transaction reviewed and confirmed by the user in Books.';
+  const path = rowPath(configuration, configuration.sourceEventsTableId, reviewId);
+  const commonData = {
+    amountCents,
+    currency,
+    reviewUpdatedAt: now,
+    transactionMemo,
+  };
+
+  try {
+    await appwriteJson({
+      apiKey,
+      body: {
+        data: {
+          ...commonData,
+          eventStatus: 'review_confirmed',
+          reviewReason,
+        },
       },
-    },
-    failureMessage: 'KeepFlip could not confirm this transaction review.',
-    fetchImpl,
-    method: 'PATCH',
-    path: rowPath(configuration, configuration.sourceEventsTableId, reviewId),
-    runtime,
-  });
+      failureMessage: 'KeepFlip could not confirm this transaction review.',
+      fetchImpl,
+      method: 'PATCH',
+      path,
+      runtime,
+    });
+  } catch (error) {
+    if (!(error instanceof ReviewUpstreamError) || error.status !== 400) {
+      throw error;
+    }
+
+    // Older book_source_events schemas may constrain eventStatus to the
+    // original review values. Preserve that valid status and store an
+    // explicit confirmation marker in the review audit fields instead.
+    await appwriteJson({
+      apiKey,
+      body: {
+        data: {
+          ...commonData,
+          eventStatus: text(reviewRow.eventStatus, 40) || 'needs_review',
+          reviewReason: fallbackConfirmedReviewReason(reviewRow),
+        },
+      },
+      failureMessage: 'KeepFlip could not confirm this transaction review.',
+      fetchImpl,
+      method: 'PATCH',
+      path,
+      runtime,
+    });
+  }
+
   return {
     amountCents,
     currency,
@@ -640,6 +739,14 @@ async function confirmGeneralReview({ loaded, runtime, fetchImpl, now }) {
 
 async function handleReviewConfirm({ req, res, runtime, fetchImpl, now }) {
   const loaded = await loadOwnedReview({ fetchImpl, req, runtime });
+  if (isFallbackConfirmedReviewRow(loaded.reviewRow)) {
+    return res.json({
+      alreadyConfirmed: true,
+      ok: true,
+      status: 'review_confirmed',
+    });
+  }
+
   const status = text(loaded.reviewRow.eventStatus, 40);
   if (!OPEN_REVIEW_STATUSES.has(status)) {
     if (status === 'review_confirmed' || status === 'posted') {
@@ -672,7 +779,10 @@ async function listConfirmedReviews({ runtime, configuration, apiKey, ownerId, f
   return rows.filter(
     (row) =>
       text(row?.source, 80) === 'ebay_finances' &&
-      text(row?.eventStatus, 40) === 'review_confirmed',
+      (
+        text(row?.eventStatus, 40) === 'review_confirmed' ||
+        isFallbackConfirmedReviewRow(row)
+      ),
   );
 }
 
@@ -686,7 +796,7 @@ async function restoreConfirmedReviews({ runtime, configuration, apiKey, snapsho
         data: {
           amountCents: Number(row.amountCents),
           currency: text(row.currency, 8) || 'XXX',
-          eventStatus: 'review_confirmed',
+          eventStatus: text(row.eventStatus, 40) || 'review_confirmed',
           reviewReason: text(row.reviewReason, 1_000) || null,
           reviewUpdatedAt: text(row.reviewUpdatedAt, 80) || null,
           sourceType: text(row.sourceType, 60) || 'unclassified',
@@ -729,8 +839,11 @@ function statusForError(error) {
 }
 
 function messageForError(error) {
-  if (error instanceof ReviewHttpError || error instanceof ReviewUpstreamError) {
-    return error.message;
+  if (error instanceof ReviewHttpError) return error.message;
+  if (error instanceof ReviewUpstreamError) {
+    return error.upstreamMessage
+      ? `${error.message} Appwrite reported: ${error.upstreamMessage}`
+      : error.message;
   }
   return 'KeepFlip could not update this Books review. Please try again.';
 }
@@ -748,6 +861,9 @@ export function createHandler(options = {}) {
     try {
       if (method === 'POST' && path === '/review/detail') {
         return await handleReviewDetail({ ...context, fetchImpl, runtime });
+      }
+      if (method === 'POST' && path === '/review/list') {
+        return await handleReviewList({ ...context, fetchImpl, runtime });
       }
       if (method === 'POST' && path === '/review/confirm') {
         const now = new Date(nowProvider()).toISOString();
@@ -789,7 +905,10 @@ export function createHandler(options = {}) {
       }
       return existingHandler(context);
     } catch (error) {
-      context?.log?.(`[KeepFlip Books] ${method} ${path} review workflow failed: ${error instanceof Error ? error.message : 'unknown error'}`);
+      const upstreamDetail = error instanceof ReviewUpstreamError && error.upstreamMessage
+        ? ` upstream=${error.upstreamMessage}`
+        : '';
+      context?.log?.(`[KeepFlip Books] ${method} ${path} review workflow failed: ${error instanceof Error ? error.message : 'unknown error'}${upstreamDetail}`);
       return context.res.json(
         { error: messageForError(error), ok: false },
         statusForError(error),
