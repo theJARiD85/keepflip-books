@@ -11,7 +11,10 @@ import {
   postPayout,
   postSale,
 } from '../src/bookkeeping-domain.js';
-import { sourceEventPersistenceOperation } from '../src/main.js';
+import {
+  reviewItemForRow,
+  sourceEventPersistenceOperation,
+} from '../src/main.js';
 
 test('an inventory purchase creates a balanced two-sided entry', () => {
   const entry = postInventoryPurchase({
@@ -113,6 +116,7 @@ test('unbalanced journal lines are rejected', () => {
 
 test('eBay sale parsing uses fee basis as gross sale and isolates marketplace tax', () => {
   const parsed = parseEbayFinanceTransaction({
+    bookingEntry: 'CREDIT',
     eBayCollectedTaxAmount: { currency: 'USD', value: '4.20' },
     orderId: '12-34567-89012',
     totalFeeAmount: { currency: 'USD', value: '7.00' },
@@ -140,9 +144,28 @@ test('eBay sale parsing uses fee basis as gross sale and isolates marketplace ta
   );
 });
 
+test('eBay sale parsing accepts explicitly reported zero fees and zero marketplace tax', () => {
+  const parsed = parseEbayFinanceTransaction({
+    bookingEntry: 'CREDIT',
+    eBayCollectedTaxAmount: { currency: 'USD', value: '0.00' },
+    totalFeeAmount: { currency: 'USD', value: '0.00' },
+    totalFeeBasisAmount: { currency: 'USD', value: '50.00' },
+    transactionDate: '2026-08-29T12:00:00.000Z',
+    transactionId: 'txn-zero-fees',
+    transactionType: 'SALE',
+  });
+
+  assert.equal(parsed.status, 'ready');
+  assert.equal(parsed.eventType, 'sale');
+  assert.equal(parsed.grossSaleCents, 5_000);
+  assert.equal(parsed.feeCents, 0);
+  assert.equal(parsed.marketplaceCollectedTaxCents, 0);
+});
+
 test('eBay fee and payout parsing never converts decimal money through floats', () => {
   const fee = parseEbayFinanceTransaction({
     amount: { currency: 'USD', value: '12.05' },
+    bookingEntry: 'DEBIT',
     transactionDate: '2026-08-29T12:00:00.000Z',
     transactionId: 'fee-1',
     transactionType: 'NON_SALE_CHARGE',
@@ -185,6 +208,7 @@ test('an eBay payout without an identity is held for review instead of aborting 
 
 test('a multi-item eBay sale is held for review instead of assigning all COGS to one item', () => {
   const parsed = parseEbayFinanceTransaction({
+    bookingEntry: 'CREDIT',
     orderLineItems: [{ lineItemId: 'one' }, { lineItemId: 'two' }],
     totalFeeBasisAmount: { currency: 'USD', value: '50.00' },
     transactionDate: '2026-08-29T12:00:00.000Z',
@@ -195,7 +219,108 @@ test('a multi-item eBay sale is held for review instead of assigning all COGS to
   assert.equal(parsed.status, 'needs_review');
   assert.equal(parsed.eventType, null);
   assert.equal(parsed.amountCents, 5_000);
+  assert.equal(parsed.reviewSourceType, 'sale_multi_item');
 });
+
+test('unsupported eBay transaction types preserve their actual amount, currency, and raw type', () => {
+  const parsed = parseEbayFinanceTransaction({
+    amount: { currency: 'USD', value: '19.19' },
+    bookingEntry: 'DEBIT',
+    transactionDate: '2026-08-29T12:00:00.000Z',
+    transactionId: 'adjustment-1',
+    transactionType: 'ADJUSTMENT',
+  });
+
+  assert.equal(parsed.status, 'needs_review');
+  assert.equal(parsed.eventType, null);
+  assert.equal(parsed.amountCents, 1_919);
+  assert.equal(parsed.currency, 'USD');
+  assert.equal(parsed.reviewSourceType, 'adjustment');
+  assert.match(parsed.reviewReason, /ADJUSTMENT/);
+});
+
+test('an actual zero-dollar eBay record stays distinguishable from an unreadable amount', () => {
+  const parsed = parseEbayFinanceTransaction({
+    amount: { currency: 'USD', value: '0.00' },
+    bookingEntry: 'DEBIT',
+    transactionDate: '2026-08-29T12:00:00.000Z',
+    transactionId: 'adjustment-zero',
+    transactionType: 'ADJUSTMENT',
+  });
+
+  assert.equal(parsed.status, 'needs_review');
+  assert.equal(parsed.amountCents, 0);
+  assert.equal(parsed.currency, 'USD');
+  assert.equal(parsed.reviewSourceType, 'adjustment');
+  assert.match(parsed.reviewReason, /eBay itself reported/i);
+});
+
+test('a non-sale charge credit is held instead of being posted as another expense', () => {
+  const parsed = parseEbayFinanceTransaction({
+    amount: { currency: 'USD', value: '4.25' },
+    bookingEntry: 'CREDIT',
+    transactionDate: '2026-08-29T12:00:00.000Z',
+    transactionId: 'charge-credit-1',
+    transactionType: 'NON_SALE_CHARGE',
+  });
+
+  assert.equal(parsed.status, 'needs_review');
+  assert.equal(parsed.eventType, null);
+  assert.equal(parsed.amountCents, 425);
+  assert.equal(parsed.reviewSourceType, 'non_sale_charge_credit');
+});
+
+test('a shipping-label credit is held instead of becoming a shipping expense', () => {
+  const parsed = parseEbayFinanceTransaction({
+    amount: { currency: 'USD', value: '6.50' },
+    bookingEntry: 'CREDIT',
+    transactionDate: '2026-08-29T12:00:00.000Z',
+    transactionId: 'label-credit-1',
+    transactionType: 'SHIPPING_LABEL',
+  });
+
+  assert.equal(parsed.status, 'needs_review');
+  assert.equal(parsed.eventType, null);
+  assert.equal(parsed.amountCents, 650);
+  assert.equal(parsed.reviewSourceType, 'shipping_label_credit');
+});
+
+test('legacy Unknown / $0.00 review rows are exposed as unavailable instead of money', () => {
+  const item = reviewItemForRow({
+    $id: 'legacy-row',
+    amountCents: 0,
+    currency: 'USD',
+    eventStatus: 'needs_review',
+    externalKey: 'legacy-transaction',
+    occurredAt: '2026-08-23T12:00:00.000Z',
+    sourceType: 'unknown',
+  });
+
+  assert.equal(item.amountKnown, false);
+  assert.equal(item.amountCents, null);
+  assert.equal(item.currency, null);
+  assert.equal(item.legacyFallback, true);
+  assert.match(item.reason, /older sync/i);
+});
+
+test('a source-reported zero-dollar adjustment remains a known zero in the review API', () => {
+  const item = reviewItemForRow({
+    $id: 'zero-row',
+    amountCents: 0,
+    currency: 'USD',
+    eventStatus: 'needs_review',
+    externalKey: 'adjustment-zero',
+    occurredAt: '2026-08-23T12:00:00.000Z',
+    sourceType: 'adjustment',
+  });
+
+  assert.equal(item.amountKnown, true);
+  assert.equal(item.amountCents, 0);
+  assert.equal(item.currency, 'USD');
+  assert.equal(item.legacyFallback, false);
+  assert.match(item.reason, /eBay itself reported/i);
+});
+
 test('a reviewed eBay source event is promoted instead of creating a duplicate', () => {
   const operation = sourceEventPersistenceOperation({
     configuration: {
