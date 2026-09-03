@@ -1114,6 +1114,57 @@ async function fetchEbayPayouts({ configuration, accessToken, start, end, fetchI
   return payouts;
 }
 
+async function fetchEbaySaleForReview({
+  configuration,
+  accessToken,
+  reviewRow,
+  fetchImpl,
+  now,
+}) {
+  const externalKey = text(reviewRow?.externalKey, 180);
+  const orderId = text(reviewRow?.orderId, 180);
+  if (!externalKey) {
+    throw new HttpError(409, 'This review record is missing its eBay transaction ID. Sync money again before reviewing it.');
+  }
+
+  const params = new URLSearchParams({ limit: '100', offset: '0' });
+  if (orderId) {
+    params.append('filter', `orderId:{${orderId}}`);
+  } else {
+    params.append('filter', 'transactionType:{SALE}');
+    params.append('filter', `transactionId:{${externalKey}}`);
+  }
+
+  const payload = await eBayFinanceJson({
+    accessToken,
+    configuration,
+    fetchImpl,
+    path: `/sell/finances/v1/transaction?${params.toString()}`,
+  });
+  const transactions = Array.isArray(payload?.transactions) ? payload.transactions : [];
+  const raw =
+    transactions.find((transaction) => text(transaction?.transactionId, 180) === externalKey) ??
+    transactions.find(
+      (transaction) =>
+        text(transaction?.transactionType, 80).toUpperCase() === 'SALE' &&
+        (!orderId || text(transaction?.orderId, 180) === orderId),
+    );
+  if (!raw) {
+    throw new HttpError(409, 'KeepFlip could not reload this exact eBay sale. Sync money again, then retry the review.');
+  }
+
+  const parsed = parseEbayFinanceTransaction(raw, { fallbackOccurredAt: now });
+  if (
+    parsed.status !== 'ready' ||
+    parsed.eventType !== 'sale' ||
+    text(parsed.externalId, 180) !== externalKey ||
+    parsed.currency !== 'USD'
+  ) {
+    throw new HttpError(409, 'This eBay sale still needs a manual Books review and cannot be safely auto-posted.');
+  }
+  return parsed;
+}
+
 async function findItemForEbayEvent({ runtime, configuration, apiKey, ownerId, identifiers, fetchImpl }) {
   const unique = [...new Set((Array.isArray(identifiers) ? identifiers : []).map((value) => text(value, 180)).filter(Boolean))].slice(0, 20);
   for (const column of ['ebayListingId', 'ebaySku', 'ebayOfferId']) {
@@ -1445,7 +1496,7 @@ async function handleReviewResolve({ req, res, runtime, fetchImpl, now }) {
   const body = requestBody(req);
   const ownerId = await authenticatedUserId({ fetchImpl, req, runtime });
   const apiKey = dynamicApiKey(req);
-  const configuration = tableConfiguration();
+  const configuration = ebayConfiguration(body.environment);
   const reviewId = text(body.reviewId, 64);
   if (!reviewId) throw new HttpError(400, 'Choose the money review item to finish.');
 
@@ -1469,7 +1520,7 @@ async function handleReviewResolve({ req, res, runtime, fetchImpl, now }) {
   if (status === 'needs_item_cost') {
     throw new HttpError(
       409,
-      'This sale only needs its original item cost. Open the linked inventory item and enter the actual COGS from Max Profit.',
+      'This sale already posted and only needs its original item cost. Open the linked inventory item and add the actual COGS; KeepFlip will keep the review visible until the cost workflow can reconcile it.',
     );
   }
   if (sourceType !== 'sale') {
@@ -1478,6 +1529,33 @@ async function handleReviewResolve({ req, res, runtime, fetchImpl, now }) {
       'This record needs a manual Books review and cannot be safely auto-posted from Command Center.',
     );
   }
+
+  const connection = await getRowOrNull({
+    apiKey,
+    configuration,
+    fetchImpl,
+    rowId: connectionRowId(ownerId, configuration.environment),
+    runtime,
+    tableId: configuration.connectionsTableId,
+  });
+  if (!isSyncEligibleEbayConnection(connection, ownerId, configuration.environment)) {
+    throw new HttpError(401, 'Reconnect eBay before finishing this money review.');
+  }
+  const accessToken = await refreshEbayToken({
+    apiKey,
+    configuration,
+    connection,
+    fetchImpl,
+    now,
+    runtime,
+  });
+  const ebaySale = await fetchEbaySaleForReview({
+    accessToken,
+    configuration,
+    fetchImpl,
+    now,
+    reviewRow,
+  });
 
   const itemId = text(body.itemId, 64) || text(reviewRow.itemId, 64);
   if (!itemId) throw new HttpError(400, 'Choose the KeepFlip inventory item that sold.');
@@ -1490,18 +1568,14 @@ async function handleReviewResolve({ req, res, runtime, fetchImpl, now }) {
     runtime,
   });
   const sale = inventorySaleState(item, body.quantity);
-  const externalKey = text(reviewRow.externalKey, 255);
-  const occurredAt = dateValue(reviewRow.occurredAt, 'Sale date');
-  const amountCents = integerCents(reviewRow.amountCents, 'Sale amount');
+  const externalKey = text(ebaySale.externalId, 180);
+  const occurredAt = dateValue(ebaySale.occurredAt, 'Sale date');
+  const orderId = text(ebaySale.orderId, 180) || text(reviewRow.orderId, 180) || null;
 
   const entry = postBookkeepingEvent({
+    ...ebaySale,
     costCents: sale.costCents,
-    currency: text(reviewRow.currency, 8) || 'USD',
-    eventType: 'sale',
-    feeCents: 0,
-    grossSaleCents: amountCents,
     itemId,
-    marketplaceCollectedTaxCents: 0,
     notes: 'Reviewed in KeepFlip Command Center',
     occurredAt,
     sourceKey: `ebay_finances:${externalKey}`,
@@ -1510,7 +1584,7 @@ async function handleReviewResolve({ req, res, runtime, fetchImpl, now }) {
   const itemUpdate = itemUpdateForSale({
     externalKey,
     occurredAt,
-    orderId: text(reviewRow.orderId, 180) || null,
+    orderId,
     ownerId,
     sale,
     source: 'ebay_finances',
@@ -1526,7 +1600,7 @@ async function handleReviewResolve({ req, res, runtime, fetchImpl, now }) {
     fetchImpl,
     itemUpdate,
     now,
-    orderId: text(reviewRow.orderId, 180) || null,
+    orderId,
     ownerId,
     runtime,
     source: 'ebay_finances',
