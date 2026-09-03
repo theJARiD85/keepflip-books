@@ -4,7 +4,7 @@ import { BOOK_ACCOUNT } from './bookkeeping-domain.js';
 import {
   createHandler as createExistingHandler,
   reviewItemForRow,
-} from './main.js';
+} from './main-existing.js';
 
 const OPEN_REVIEW_STATUSES = new Set([
   'needs_item_match',
@@ -729,7 +729,9 @@ function statusForError(error) {
 }
 
 function messageForError(error) {
-  if (error instanceof ReviewHttpError) return error.message;
+  if (error instanceof ReviewHttpError || error instanceof ReviewUpstreamError) {
+    return error.message;
+  }
   return 'KeepFlip could not update this Books review. Please try again.';
 }
 
