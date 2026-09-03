@@ -72,13 +72,16 @@ export function assertCents(value, label = 'Amount') {
   return value;
 }
 
-export function moneyToCents(money, label = 'Money') {
+function parseMoneyToCents(money, label, { allowZero = false } = {}) {
   const source = money && typeof money === 'object' ? money : null;
   const currency = text(source?.currency, 8).toUpperCase();
   const value = text(source?.value, 48);
 
   if (!currency || !value) {
     throw new BookkeepingValidationError(`${label} is missing its amount.`);
+  }
+  if (!/^[A-Z]{3}$/.test(currency)) {
+    throw new BookkeepingValidationError(`${label} has an unsupported currency.`);
   }
 
   // eBay returns decimal strings. Parse them directly instead of converting
@@ -91,9 +94,19 @@ export function moneyToCents(money, label = 'Money') {
   const whole = Number(match[2]);
   const fraction = Number((match[3] ?? '').padEnd(2, '0') || '0');
   const cents = whole * 100 + fraction;
-  assertCents(cents, label);
+  if (!Number.isSafeInteger(cents) || cents < 0 || (!allowZero && cents === 0)) {
+    throw new BookkeepingValidationError(
+      allowZero
+        ? `${label} must be a non-negative whole number of cents.`
+        : `${label} must be a positive whole number of cents.`,
+    );
+  }
 
   return { cents, currency };
+}
+
+export function moneyToCents(money, label = 'Money') {
+  return parseMoneyToCents(money, label);
 }
 
 function debit(accountCode, amountCents, memo = '') {
@@ -410,20 +423,32 @@ export function postBookkeepingEvent(input) {
   }
 }
 
-function firstMoney(source, keys, label) {
+function firstMoney(source, keys, label, options = {}) {
   for (const key of keys) {
     const value = source?.[key];
-    if (value && typeof value === 'object') return moneyToCents(value, label);
+    if (value && typeof value === 'object') {
+      return parseMoneyToCents(value, label, options);
+    }
   }
   throw new BookkeepingValidationError(`${label} was not supplied by eBay.`);
 }
 
-function optionalMoney(source, keys, label) {
+function optionalMoney(source, keys, label, options = {}) {
   for (const key of keys) {
     const value = source?.[key];
-    if (value && typeof value === 'object') return moneyToCents(value, label);
+    if (value && typeof value === 'object') {
+      return parseMoneyToCents(value, label, options);
+    }
   }
   return null;
+}
+
+function safeOptionalMoney(source, keys, label, options = {}) {
+  try {
+    return optionalMoney(source, keys, label, options);
+  } catch {
+    return null;
+  }
 }
 
 function identifiersFromEbayTransaction(raw) {
@@ -457,6 +482,16 @@ function identifiersFromEbayTransaction(raw) {
   return [...values];
 }
 
+function reviewType(transactionType, suffix = '') {
+  const raw = text(transactionType, 80).toLowerCase() || 'unclassified';
+  return suffix ? `${raw}_${suffix}`.slice(0, 60) : raw;
+}
+
+function bookingMismatchReason(transactionType, bookingEntry, expected) {
+  const actual = bookingEntry || 'MISSING';
+  return `eBay reported ${transactionType} with booking entry ${actual}; KeepFlip expected ${expected} and held it instead of guessing.`;
+}
+
 /**
  * Converts a raw eBay Finances transaction into a no-PII posting request.
  * Unknown or insufficient data is returned as a review item, not guessed.
@@ -466,15 +501,29 @@ export function parseEbayFinanceTransaction(raw, options = {}) {
   const transactionType = text(source.transactionType, 80).toUpperCase();
   const transactionId = text(source.transactionId, 180);
   const occurredAt = text(source.transactionDate, 64);
+  const bookingEntry = text(source.bookingEntry, 32).toUpperCase();
+  const reportedAmount = safeOptionalMoney(
+    source,
+    ['amount'],
+    'eBay transaction amount',
+    { allowZero: true },
+  );
+  const reviewSourceType = reviewType(transactionType);
+
   if (!transactionType || !transactionId || !occurredAt) {
     const externalId = invalidEbayExternalId(source, 'transaction');
     return {
+      ...(reportedAmount
+        ? { amountCents: reportedAmount.cents, currency: reportedAmount.currency }
+        : {}),
+      bookingEntry: bookingEntry || null,
       eventType: null,
       externalId,
       itemIdentifiers: [],
       occurredAt: occurredAt || reviewOccurredAt(options?.fallbackOccurredAt),
       orderId: text(source.orderId, 180) || null,
       reviewReason: 'eBay transaction is missing its identity or date.',
+      reviewSourceType,
       sourceKey: `ebay:invalid:${externalId}`,
       status: 'needs_review',
     };
@@ -482,11 +531,16 @@ export function parseEbayFinanceTransaction(raw, options = {}) {
 
   const sourceKey = `ebay:${transactionType}:${transactionId}`;
   const common = {
+    ...(reportedAmount
+      ? { amountCents: reportedAmount.cents, currency: reportedAmount.currency }
+      : {}),
+    bookingEntry: bookingEntry || null,
     occurredAt,
     sourceKey,
     externalId: transactionId,
     itemIdentifiers: identifiersFromEbayTransaction(source),
     orderId: text(source.orderId, 180) || null,
+    reviewSourceType,
   };
 
   try {
@@ -495,7 +549,30 @@ export function parseEbayFinanceTransaction(raw, options = {}) {
         source,
         ['totalFeeBasisAmount'],
         'eBay gross sale',
+        { allowZero: true },
       );
+      if (gross.cents === 0) {
+        return {
+          ...common,
+          amountCents: 0,
+          currency: gross.currency,
+          eventType: null,
+          reviewReason: 'eBay itself reported a zero gross sale amount, so KeepFlip held the sale instead of posting a fabricated value.',
+          reviewSourceType: reviewType(transactionType, 'zero_amount'),
+          status: 'needs_review',
+        };
+      }
+      if (bookingEntry !== 'CREDIT') {
+        return {
+          ...common,
+          amountCents: gross.cents,
+          currency: gross.currency,
+          eventType: null,
+          reviewReason: bookingMismatchReason(transactionType, bookingEntry, 'CREDIT'),
+          reviewSourceType: reviewType(transactionType, bookingEntry ? bookingEntry.toLowerCase() : 'booking_unknown'),
+          status: 'needs_review',
+        };
+      }
       const lineItemCount = Array.isArray(source.orderLineItems)
         ? source.orderLineItems.length
         : 0;
@@ -507,14 +584,21 @@ export function parseEbayFinanceTransaction(raw, options = {}) {
           eventType: null,
           reviewReason:
             'This eBay sale contains more than one item and needs an item-by-item review.',
+          reviewSourceType: reviewType(transactionType, 'multi_item'),
           status: 'needs_review',
         };
       }
-      const fees = optionalMoney(source, ['totalFeeAmount'], 'eBay selling fees');
+      const fees = optionalMoney(
+        source,
+        ['totalFeeAmount'],
+        'eBay selling fees',
+        { allowZero: true },
+      );
       const salesTax = optionalMoney(
         source,
         ['eBayCollectedTaxAmount'],
         'eBay-collected tax',
+        { allowZero: true },
       );
       return {
         ...common,
@@ -523,33 +607,129 @@ export function parseEbayFinanceTransaction(raw, options = {}) {
         grossSaleCents: gross.cents,
         marketplaceCollectedTaxCents: salesTax?.cents ?? 0,
         feeCents: fees?.cents ?? 0,
+        reviewSourceType: 'sale',
         status: 'ready',
         summary: 'eBay sale',
       };
     }
 
-    const amount = firstMoney(source, ['amount'], `eBay ${transactionType}`);
-    const bookingEntry = text(source.bookingEntry, 32).toUpperCase();
-    const base = { ...common, amountCents: amount.cents, currency: amount.currency };
+    const amount = firstMoney(
+      source,
+      ['amount'],
+      `eBay ${transactionType}`,
+      { allowZero: true },
+    );
+    const base = {
+      ...common,
+      amountCents: amount.cents,
+      currency: amount.currency,
+    };
+
+    if (amount.cents === 0) {
+      return {
+        ...base,
+        eventType: null,
+        reviewReason: `eBay itself reported this ${transactionType} transaction as 0.00 ${amount.currency}; KeepFlip preserved that value and held the record instead of inventing money movement.`,
+        status: 'needs_review',
+      };
+    }
 
     if (transactionType === 'SHIPPING_LABEL') {
-      return { ...base, eventType: 'shipping_label', status: 'ready', summary: 'eBay shipping label' };
+      if (bookingEntry === 'DEBIT') {
+        return {
+          ...base,
+          eventType: 'shipping_label',
+          reviewSourceType: 'shipping_label',
+          status: 'ready',
+          summary: 'eBay shipping label',
+        };
+      }
+      return {
+        ...base,
+        eventType: null,
+        reviewReason: bookingMismatchReason(transactionType, bookingEntry, 'DEBIT'),
+        reviewSourceType: reviewType(
+          transactionType,
+          bookingEntry === 'CREDIT' ? 'credit' : 'booking_unknown',
+        ),
+        status: 'needs_review',
+      };
     }
+
     if (transactionType === 'REFUND') {
-      return { ...base, eventType: 'refund', status: 'ready', summary: 'eBay customer refund' };
+      if (bookingEntry === 'DEBIT') {
+        return {
+          ...base,
+          eventType: 'refund',
+          reviewSourceType: 'refund',
+          status: 'ready',
+          summary: 'eBay customer refund',
+        };
+      }
+      return {
+        ...base,
+        eventType: null,
+        reviewReason: bookingMismatchReason(transactionType, bookingEntry, 'DEBIT'),
+        reviewSourceType: reviewType(
+          transactionType,
+          bookingEntry === 'CREDIT' ? 'credit' : 'booking_unknown',
+        ),
+        status: 'needs_review',
+      };
     }
+
     if (transactionType === 'CREDIT') {
-      return { ...base, eventType: 'marketplace_credit', status: 'ready', summary: 'eBay credit' };
+      if (bookingEntry === 'CREDIT') {
+        return {
+          ...base,
+          eventType: 'marketplace_credit',
+          reviewSourceType: 'credit',
+          status: 'ready',
+          summary: 'eBay credit',
+        };
+      }
+      return {
+        ...base,
+        eventType: null,
+        reviewReason: bookingMismatchReason(transactionType, bookingEntry, 'CREDIT'),
+        reviewSourceType: reviewType(
+          transactionType,
+          bookingEntry === 'DEBIT' ? 'debit' : 'booking_unknown',
+        ),
+        status: 'needs_review',
+      };
     }
+
     if (transactionType === 'NON_SALE_CHARGE') {
-      return { ...base, eventType: 'marketplace_fee', status: 'ready', summary: 'eBay account charge' };
+      if (bookingEntry === 'DEBIT') {
+        return {
+          ...base,
+          eventType: 'marketplace_fee',
+          reviewSourceType: 'non_sale_charge',
+          status: 'ready',
+          summary: 'eBay account charge',
+        };
+      }
+      return {
+        ...base,
+        eventType: null,
+        reviewReason:
+          bookingEntry === 'CREDIT'
+            ? 'eBay reported a NON_SALE_CHARGE credit. KeepFlip held it because a fee credit should not be posted as a new marketplace expense or generic income.'
+            : bookingMismatchReason(transactionType, bookingEntry, 'DEBIT'),
+        reviewSourceType: reviewType(
+          transactionType,
+          bookingEntry === 'CREDIT' ? 'credit' : 'booking_unknown',
+        ),
+        status: 'needs_review',
+      };
     }
 
     return {
       ...base,
-      bookingEntry: bookingEntry || null,
       eventType: null,
-      reviewReason: `eBay transaction type ${transactionType} needs a review rule.`,
+      reviewReason: `eBay transaction type ${transactionType}${bookingEntry ? ` (${bookingEntry})` : ''} needs a dedicated accounting rule before KeepFlip can post it safely.`,
+      reviewSourceType,
       status: 'needs_review',
     };
   } catch (error) {
@@ -560,6 +740,7 @@ export function parseEbayFinanceTransaction(raw, options = {}) {
         error instanceof Error
           ? error.message
           : 'eBay transaction could not be read safely.',
+      reviewSourceType,
       status: 'needs_review',
     };
   }
@@ -570,36 +751,70 @@ export function parseEbayPayout(raw, options = {}) {
   const payoutId = text(source.payoutId, 180);
   const occurredAt =
     text(source.payoutDate, 64) || text(source.transactionDate, 64);
+  const reportedAmount = safeOptionalMoney(
+    source,
+    ['amount'],
+    'eBay payout',
+    { allowZero: true },
+  );
+
   if (!payoutId || !occurredAt) {
     const externalId = invalidEbayExternalId(source, 'payout');
     return {
+      ...(reportedAmount
+        ? { amountCents: reportedAmount.cents, currency: reportedAmount.currency }
+        : {}),
       eventType: null,
       externalId,
       occurredAt: occurredAt || reviewOccurredAt(options?.fallbackOccurredAt),
       reviewReason: 'eBay payout is missing its identity or date.',
+      reviewSourceType: 'payout',
       sourceKey: `ebay:invalid:${externalId}`,
       status: 'needs_review',
     };
   }
   try {
-    const amount = firstMoney(source, ['amount'], 'eBay payout');
+    const amount = firstMoney(
+      source,
+      ['amount'],
+      'eBay payout',
+      { allowZero: true },
+    );
+    if (amount.cents === 0) {
+      return {
+        amountCents: 0,
+        currency: amount.currency,
+        eventType: null,
+        externalId: payoutId,
+        occurredAt,
+        reviewReason: `eBay itself reported this payout as 0.00 ${amount.currency}; KeepFlip held it instead of creating a zero-dollar transfer.`,
+        reviewSourceType: 'payout',
+        sourceKey: `ebay:payout:${payoutId}`,
+        status: 'needs_review',
+      };
+    }
     return {
       amountCents: amount.cents,
       currency: amount.currency,
       eventType: 'payout',
       externalId: payoutId,
       occurredAt,
+      reviewSourceType: 'payout',
       sourceKey: `ebay:payout:${payoutId}`,
       status: 'ready',
       summary: 'eBay payout deposited',
     };
   } catch (error) {
     return {
+      ...(reportedAmount
+        ? { amountCents: reportedAmount.cents, currency: reportedAmount.currency }
+        : {}),
       eventType: null,
       externalId: payoutId,
       occurredAt,
       reviewReason:
         error instanceof Error ? error.message : 'eBay payout could not be read safely.',
+      reviewSourceType: 'payout',
       sourceKey: `ebay:payout:${payoutId}`,
       status: 'needs_review',
     };
