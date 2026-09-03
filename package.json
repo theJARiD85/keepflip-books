@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "main": "src/main.js",
+  "main": "src/main-v2.js",
   "scripts": {
-    "check": "node --check src/bookkeeping-domain.js && node --check src/main.js",
+    "check": "node --check src/bookkeeping-domain.js && node --check src/main-core.js && node --check src/main.js && node --check src/main-v2.js",
     "test": "node --test test/bookkeeping-domain.test.js test/main.test.js"
   }
 }
