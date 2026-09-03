@@ -495,6 +495,7 @@ async function ensureBookAccounts({ runtime, configuration, apiKey, ownerId, now
 function digestForSource(event) {
   const safeSource = {
     amountCents: event.amountCents,
+    bookingEntry: event.bookingEntry,
     currency: event.currency,
     eventType: event.eventType,
     externalKey: event.externalKey,
@@ -502,6 +503,7 @@ function digestForSource(event) {
     occurredAt: event.occurredAt,
     orderId: event.orderId,
     payoutId: event.payoutId,
+    reviewSourceType: event.reviewSourceType,
     source: event.source,
   };
   return createHash('sha256').update(JSON.stringify(safeSource), 'utf8').digest('hex');
@@ -525,29 +527,52 @@ function sourceEventData({ ownerId, source, externalKey, sourceType, eventStatus
   };
 }
 
+function reviewSourceTypeForEvent(event) {
+  const raw =
+    text(event?.reviewSourceType, 60).toLowerCase() ||
+    text(event?.eventType, 60).toLowerCase() ||
+    'unclassified';
+  const currency = text(event?.currency, 8).toUpperCase();
+  if (currency && currency !== 'USD' && !raw.endsWith('_foreign_currency')) {
+    return `${raw}_foreign_currency`.slice(0, 60);
+  }
+  return raw;
+}
+
+function reviewAmountForEvent(event) {
+  const amountCents = Number(event?.amountCents);
+  const currency = text(event?.currency, 8).toUpperCase();
+  const amountKnown =
+    Number.isSafeInteger(amountCents) &&
+    amountCents >= 0 &&
+    /^[A-Z]{3}$/.test(currency);
+  return {
+    amountCents: amountKnown ? amountCents : 0,
+    currency: amountKnown ? currency : 'XXX',
+  };
+}
+
 async function recordReviewEvent({ runtime, configuration, apiKey, ownerId, event, status, reason, fetchImpl, now }) {
   const rowId = sourceEventRowId(ownerId, event.source, event.externalKey);
+  const reviewAmount = reviewAmountForEvent(event);
+  const sourceType = reviewSourceTypeForEvent(event);
   const data = sourceEventData({
-    amountCents:
-      Number.isSafeInteger(event.amountCents) && event.amountCents >= 0
-        ? event.amountCents
-        : 0,
-    currency: event.currency || 'USD',
+    amountCents: reviewAmount.amountCents,
+    currency: reviewAmount.currency,
     eventStatus: status,
-    event: undefined,
     externalKey: event.externalKey,
     itemId: event.itemId,
     now,
     occurredAt: event.occurredAt,
     orderId: event.orderId,
     ownerId,
-    payloadDigest: digestForSource(event),
+    payloadDigest: digestForSource({ ...event, reviewSourceType: sourceType }),
     payoutId: event.payoutId,
     source: event.source,
-    sourceType: event.eventType || 'unknown',
+    sourceType,
   });
   data.eventStatus = status;
-  data.sourceType = text(event.eventType || 'unknown', 60);
+  data.sourceType = sourceType;
   void reason;
 
   const existing = await getRowOrNull({
@@ -1298,7 +1323,7 @@ async function handleParsedEbayEvent({ runtime, configuration, apiKey, ownerId, 
             ? event.amountCents
             : Number.isSafeInteger(event.grossSaleCents)
               ? event.grossSaleCents
-              : 0,
+              : undefined,
         externalKey: event.externalId || event.sourceKey,
         source: 'ebay_finances',
       },
@@ -1422,41 +1447,140 @@ const REVIEW_STATUSES = new Set([
   'needs_review',
 ]);
 
+function baseReviewSourceType(value) {
+  return text(value, 60).toLowerCase().replace(/_foreign_currency$/, '');
+}
+
+function reviewSourceLabel(value) {
+  const sourceType = baseReviewSourceType(value);
+  return {
+    adjustment: 'account adjustment',
+    credit: 'marketplace credit',
+    credit_debit: 'marketplace credit reported as a debit',
+    credit_booking_unknown: 'marketplace credit',
+    dispute: 'payment dispute',
+    loan_repayment: 'loan repayment',
+    marketplace_credit: 'marketplace credit',
+    non_sale_charge: 'non-sale charge',
+    non_sale_charge_credit: 'non-sale charge credit',
+    non_sale_charge_booking_unknown: 'non-sale charge',
+    payout: 'payout',
+    purchase: 'seller-funded purchase',
+    refund: 'refund',
+    refund_credit: 'refund reported as a credit',
+    refund_booking_unknown: 'refund',
+    sale: 'sale',
+    sale_multi_item: 'multi-item sale',
+    sale_zero_amount: 'zero-value sale',
+    sale_debit: 'sale reported as a debit',
+    sale_booking_unknown: 'sale',
+    shipping_label: 'shipping label',
+    shipping_label_credit: 'shipping label credit',
+    shipping_label_booking_unknown: 'shipping label',
+    transfer: 'transfer',
+    unclassified: 'unclassified eBay record',
+    unknown: 'legacy eBay review record',
+    withdrawal: 'withdrawal',
+  }[sourceType] || sourceType.replace(/_/g, ' ') || 'eBay record';
+}
+
 function reviewReasonForRow(row) {
   const status = text(row?.eventStatus, 40);
-  const sourceType = text(row?.sourceType, 60);
+  const sourceType = text(row?.sourceType, 60).toLowerCase() || 'unclassified';
+  const baseSourceType = baseReviewSourceType(sourceType);
+  const amountCents = Number(row?.amountCents);
+  const currency = text(row?.currency, 8).toUpperCase();
+  const legacyFallback =
+    sourceType === 'unknown' &&
+    amountCents === 0 &&
+    currency === 'USD';
+
+  if (legacyFallback) {
+    return 'This review row was saved by the older sync that replaced unreadable eBay details with Unknown / $0.00. Run eBay money sync again so KeepFlip can refresh the real transaction type, amount, and currency.';
+  }
   if (status === 'needs_item_match') {
     return 'Match this eBay sale to the KeepFlip inventory item that actually sold.';
   }
   if (status === 'needs_item_cost') {
-    return 'The sale is recorded, but the linked inventory item has no actual cost yet. Add its cost so KeepFlip can finish profit reporting.';
+    return 'The sale is recorded, but the linked inventory item has no actual cost yet. KeepFlip will not invent COGS or create a second purchase.';
   }
-  if (sourceType === 'sale') {
+  if (baseSourceType === 'sale') {
     return text(row?.itemId, 64)
       ? 'Confirm how many units sold before KeepFlip moves the correct inventory cost.'
       : 'Confirm which inventory item sold and how many units were included.';
   }
-  if (sourceType === 'payout') {
-    return 'This eBay payout needs a manual check before KeepFlip can reconcile it.';
+  if (baseSourceType === 'sale_multi_item') {
+    return 'eBay reported one SALE transaction containing multiple order line items. KeepFlip preserved the real sale amount but will not assign the entire order to one inventory item.';
   }
-  return 'This synced eBay record needs a manual check before KeepFlip can post it safely.';
+  if (baseSourceType === 'sale_zero_amount') {
+    return `eBay itself reported this sale as 0.00 ${currency === 'XXX' ? '' : currency}. KeepFlip preserved the zero instead of fabricating a sale amount.`.trim();
+  }
+  if (currency === 'XXX') {
+    return `KeepFlip could not recover a trustworthy amount/currency for this ${reviewSourceLabel(sourceType)}. It is shown as unavailable instead of being turned into $0.00.`;
+  }
+  if (currency && currency !== 'USD') {
+    return `eBay reported this ${reviewSourceLabel(sourceType)} in ${currency}. KeepFlip is preserving the original currency and will not silently convert it to USD or post it as dollars.`;
+  }
+  if (Number.isSafeInteger(amountCents) && amountCents === 0) {
+    return `eBay itself reported this ${reviewSourceLabel(sourceType)} as 0.00 ${currency || 'in its source currency'}. KeepFlip is showing that exact value and is not creating a zero-dollar Books entry.`;
+  }
+
+  switch (baseSourceType) {
+    case 'adjustment':
+      return 'eBay classified this as an account ADJUSTMENT. KeepFlip preserved the amount but needs a dedicated adjustment rule before it can affect Books.';
+    case 'dispute':
+      return 'eBay classified this as a payment DISPUTE. KeepFlip will not assume whether it is a temporary hold, loss, or reversal without a dedicated dispute workflow.';
+    case 'transfer':
+      return 'eBay classified this as a TRANSFER to reimburse eBay for charges. KeepFlip is holding it to avoid double-counting the underlying refund or charge.';
+    case 'withdrawal':
+      return 'eBay classified this as a WITHDRAWAL from available seller funds. KeepFlip is holding it until it can reconcile the destination without treating it as new income or expense.';
+    case 'purchase':
+      return 'eBay classified this as a PURCHASE made with seller spendable funds. KeepFlip needs the business purpose/category before posting it as an expense.';
+    case 'loan_repayment':
+      return 'eBay classified this as a LOAN_REPAYMENT. KeepFlip will not treat principal repayment as an ordinary business expense without a liability reconciliation rule.';
+    case 'non_sale_charge_credit':
+      return 'eBay reported a NON_SALE_CHARGE with a CREDIT booking entry. KeepFlip held it because a fee credit must not be posted as another expense or generic income.';
+    case 'shipping_label_credit':
+      return 'eBay reported a SHIPPING_LABEL credit. KeepFlip held it so the credit can reduce the correct shipping expense instead of becoming generic income.';
+    case 'credit_debit':
+      return 'eBay reported a CREDIT transaction with a DEBIT booking entry. KeepFlip held the mismatch rather than guessing which side of Books it belongs on.';
+    case 'refund_credit':
+      return 'eBay reported a REFUND transaction with a CREDIT booking entry. KeepFlip held the mismatch rather than posting it as a customer refund.';
+    case 'payout':
+      return 'This eBay payout needs a manual check before KeepFlip can reconcile it.';
+    default:
+      return `eBay reported this as ${reviewSourceLabel(sourceType)}. KeepFlip preserved the source amount and type but does not yet have a safe automatic posting rule for it.`;
+  }
 }
 
-function reviewItemForRow(row) {
+export function reviewItemForRow(row) {
+  const storedAmountCents = Number(row?.amountCents);
+  const storedCurrency = text(row?.currency, 8).toUpperCase();
+  const sourceType = text(row?.sourceType, 60).toLowerCase() || 'unclassified';
+  const legacyFallback =
+    sourceType === 'unknown' &&
+    storedAmountCents === 0 &&
+    storedCurrency === 'USD';
+  const amountKnown =
+    !legacyFallback &&
+    Number.isSafeInteger(storedAmountCents) &&
+    storedAmountCents >= 0 &&
+    /^[A-Z]{3}$/.test(storedCurrency) &&
+    storedCurrency !== 'XXX';
+
   return {
-    amountCents:
-      Number.isSafeInteger(Number(row?.amountCents)) && Number(row?.amountCents) >= 0
-        ? Number(row.amountCents)
-        : 0,
-    currency: text(row?.currency, 8) || 'USD',
+    amountCents: amountKnown ? storedAmountCents : null,
+    amountKnown,
+    currency: amountKnown ? storedCurrency : null,
     externalKey: text(row?.externalKey, 255),
     id: text(row?.$id, 64),
     itemId: text(row?.itemId, 64) || null,
+    legacyFallback,
     occurredAt: text(row?.occurredAt, 64),
     orderId: text(row?.orderId, 180) || null,
     payoutId: text(row?.payoutId, 180) || null,
     reason: reviewReasonForRow(row),
-    sourceType: text(row?.sourceType, 60) || 'unknown',
+    sourceType,
     status: text(row?.eventStatus, 40),
   };
 }
@@ -1520,7 +1644,7 @@ async function handleReviewResolve({ req, res, runtime, fetchImpl, now }) {
   if (status === 'needs_item_cost') {
     throw new HttpError(
       409,
-      'This sale already posted and only needs its original item cost. Open the linked inventory item and add the actual COGS; KeepFlip will keep the review visible until the cost workflow can reconcile it.',
+      'This sale already posted and only needs its original item cost. KeepFlip will not guess COGS or create a second purchase from this review.',
     );
   }
   if (sourceType !== 'sale') {
