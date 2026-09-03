@@ -1864,7 +1864,7 @@ export function createHandler({ error, log, fetchImpl = fetch, now = () => new D
       if (path === '/overview') {
         return await handleOverview({ fetchImpl, req, res, runtime });
       }
-      error(404, 'Books endpoint not found.');
+      throw new HttpError(404, 'Books endpoint not found.');
     } catch (error) {
       safeError(log, error, method, path);
       return jsonError(res, error);
