@@ -228,3 +228,92 @@ test('a partial lot sale carries only its share of cost and the last unit gets t
     1_001,
   );
 });
+
+
+test('configured Books entrypoint serves the focused review detail route', async () => {
+  const environmentNames = [
+    'APPWRITE_BOOKS_DATABASE_ID',
+    'APPWRITE_BOOK_SOURCE_EVENTS_TABLE_ID',
+    'APPWRITE_FUNCTION_API_ENDPOINT',
+    'APPWRITE_FUNCTION_PROJECT_ID',
+  ];
+  const previous = Object.fromEntries(
+    environmentNames.map((name) => [name, process.env[name]]),
+  );
+  Object.assign(process.env, {
+    APPWRITE_BOOKS_DATABASE_ID: 'keepflip',
+    APPWRITE_BOOK_SOURCE_EVENTS_TABLE_ID: 'book_source_events',
+    APPWRITE_FUNCTION_API_ENDPOINT: 'https://appwrite.example/v1',
+    APPWRITE_FUNCTION_PROJECT_ID: 'keepflip',
+  });
+
+  try {
+    const handler = createHandler({
+      fetchImpl: async (url) => {
+        const requestUrl = new URL(url);
+        if (requestUrl.pathname === '/v1/account') {
+          return jsonResponse({ $id: 'user-1' });
+        }
+        if (
+          requestUrl.pathname ===
+          '/v1/tablesdb/keepflip/tables/book_source_events/rows/review-1'
+        ) {
+          return jsonResponse({
+            $id: 'review-1',
+            amountCents: 1919,
+            bookingEntry: 'CREDIT',
+            currency: 'GBP',
+            eventStatus: 'needs_review',
+            externalKey: 'ebay-transaction-1',
+            itemId: null,
+            occurredAt: '2026-08-22T12:00:00.000Z',
+            orderId: null,
+            ownerId: 'user-1',
+            payoutId: null,
+            rawAmountValue: '19.19',
+            rawCurrency: 'GBP',
+            rawTransactionType: 'CREDIT',
+            reviewReason: 'Confirm this marketplace credit.',
+            reviewUpdatedAt: '2026-09-03T20:00:00.000Z',
+            source: 'ebay_finances',
+            sourceType: 'marketplace_credit_foreign_currency',
+            transactionMemo: 'Marketplace credit',
+          });
+        }
+        return jsonResponse({ message: 'Not found.' }, 404);
+      },
+    });
+
+    const result = { body: null, status: null };
+    const res = {
+      json(body, status = 200) {
+        result.body = body;
+        result.status = status;
+        return body;
+      },
+    };
+
+    await handler({
+      req: {
+        bodyJson: { reviewId: 'review-1' },
+        headers: {
+          'x-appwrite-key': 'function-key',
+          'x-appwrite-user-jwt': 'user-jwt',
+        },
+        method: 'POST',
+        path: '/review/detail',
+      },
+      res,
+    });
+
+    assert.equal(result.status, 200);
+    assert.equal(result.body?.ok, true);
+    assert.equal(result.body?.item?.id, 'review-1');
+    assert.equal(result.body?.item?.rawTransactionType, 'CREDIT');
+    assert.equal(result.body?.item?.amountCents, 1919);
+    assert.equal(result.body?.item?.currency, 'GBP');
+    assert.equal(result.body?.item?.reason, 'Confirm this marketplace credit.');
+  } finally {
+    restoreEnvironment(previous);
+  }
+});
