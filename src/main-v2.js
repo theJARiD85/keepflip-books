@@ -13,6 +13,32 @@ const OPEN_REVIEW_STATUSES = new Set([
 ]);
 const CONFIRMED_REVIEW_PREFIX = '[KEEPFLIP_REVIEW_CONFIRMED]';
 
+// Keep the Books policy local to this deployment. Appwrite Functions run as
+// isolated packages, so a protected Books request must not rely on a nested
+// Subscription Police execution (or on a client-provided plan claim).
+const BOOKS_CAPABILITY_BY_PATH = new Map([
+  ['/overview', 'basic_books'],
+  ['/record', 'basic_books'],
+  ['/review/list', 'basic_books'],
+  ['/review/detail', 'basic_books'],
+  ['/review/resolve', 'basic_books'],
+  ['/review/confirm', 'basic_books'],
+  ['/ebay/sync', 'automated_books'],
+]);
+
+const BOOKS_PLAN_FEATURES = {
+  hobbyist: new Set(['basic_books']),
+  serious: new Set(['basic_books', 'automated_books']),
+  power: new Set(['basic_books', 'automated_books']),
+};
+
+const ACTIVE_SUBSCRIPTION_STATUSES = new Set(['active', 'trialing']);
+const PERIOD_ACCESS_STATUSES = new Set([
+  'cancelled',
+  'billing_issue',
+  'grace_period',
+]);
+
 class ReviewHttpError extends Error {
   constructor(status, message) {
     super(message);
@@ -87,6 +113,8 @@ function tableConfiguration() {
     transactionsTableId: firstEnvironment(['APPWRITE_BOOK_TRANSACTIONS_TABLE_ID'], 'book_transactions'),
     journalLinesTableId: firstEnvironment(['APPWRITE_BOOK_JOURNAL_LINES_TABLE_ID'], 'book_journal_lines'),
     itemsTableId: firstEnvironment(['APPWRITE_BOOK_ITEMS_TABLE_ID', 'APPWRITE_ITEMS_TABLE_ID'], 'items'),
+    subscriptionsTableId: firstEnvironment(['APPWRITE_USER_SUBSCRIPTIONS_TABLE_ID'], 'user_subscriptions'),
+    trialClaimsTableId: firstEnvironment(['APPWRITE_TRIAL_DEVICE_CLAIMS_TABLE_ID'], 'trial_device_claims'),
   };
 }
 
@@ -207,6 +235,79 @@ async function getRowOrNull({ runtime, configuration, tableId, rowId, apiKey, fe
 
 function ownerIdFromRow(row) {
   return text(row?.ownerId, 64);
+}
+
+function dateMs(value) {
+  const parsed = Date.parse(text(value, 80));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function subscriptionAllowsBooksCapability(row, ownerId, capability, now = Date.now()) {
+  if (ownerIdFromRow(row) !== ownerId) return false;
+
+  const plan = text(row?.plan, 32).toLowerCase();
+  const status = text(row?.status, 32).toLowerCase();
+  const features = BOOKS_PLAN_FEATURES[plan];
+  if (!features?.has(capability)) return false;
+
+  const periodEnd = dateMs(row?.currentPeriodEndsAt);
+  const active = ACTIVE_SUBSCRIPTION_STATUSES.has(status)
+    ? !periodEnd || periodEnd > now
+    : PERIOD_ACCESS_STATUSES.has(status)
+      ? periodEnd > now
+      : false;
+
+  if (!active) return false;
+  if (status === 'trialing' && row?.trialEndsAt && dateMs(row.trialEndsAt) <= now) {
+    return false;
+  }
+  return true;
+}
+
+function trialClaimRowId(userId) {
+  return (
+    't' +
+    createHash('sha256')
+      .update(`keepflip|trial-device-claim|owner|${userId}`)
+      .digest('hex')
+      .slice(0, 35)
+  );
+}
+
+async function requireBooksCapability({ capability, fetchImpl, now = Date.now(), req, runtime }) {
+  const ownerId = await authenticatedUserId({ fetchImpl, req, runtime });
+  const apiKey = dynamicApiKey(req);
+  const configuration = tableConfiguration();
+  const subscription = await getRowOrNull({
+    apiKey,
+    configuration,
+    fetchImpl,
+    rowId: ownerId,
+    runtime,
+    tableId: configuration.subscriptionsTableId,
+  });
+
+  if (subscriptionAllowsBooksCapability(subscription, ownerId, capability, now)) {
+    return ownerId;
+  }
+
+  // Profile trials are created by the authenticated /status request. Books
+  // only reads that durable, server-owned claim; it can never create or extend
+  // one while servicing a protected request.
+  const trialClaim = await getRowOrNull({
+    apiKey,
+    configuration,
+    fetchImpl,
+    rowId: trialClaimRowId(ownerId),
+    runtime,
+    tableId: configuration.trialClaimsTableId,
+  });
+  if (ownerIdFromRow(trialClaim) === ownerId && dateMs(trialClaim?.trialEndDate) > now) {
+    return ownerId;
+  }
+
+  const featureLabel = capability === 'automated_books' ? 'Books automation' : 'Books';
+  throw new ReviewHttpError(403, `An active KeepFlip subscription with ${featureLabel} is required.`);
 }
 
 function stableId(namespace, ...parts) {
@@ -852,13 +953,27 @@ export function createHandler(options = {}) {
   const fetchImpl = options.fetchImpl ?? fetch;
   const nowProvider = options.now ?? (() => new Date().toISOString());
   const existingHandler = createExistingHandler(options);
+  const authorizeBooksCapability =
+    typeof options.authorizeBooksCapability === 'function'
+      ? options.authorizeBooksCapability
+      : requireBooksCapability;
 
   return async (context) => {
     const method = text(context?.req?.method, 16).toUpperCase();
     const path = requestPath(context?.req);
-    const runtime = runtimeConfiguration();
 
     try {
+      const runtime = runtimeConfiguration();
+      const capability = method === 'POST' ? BOOKS_CAPABILITY_BY_PATH.get(path) : null;
+      if (capability) {
+        await authorizeBooksCapability({
+          capability,
+          fetchImpl,
+          now: new Date(nowProvider()).getTime(),
+          req: context.req,
+          runtime,
+        });
+      }
       if (method === 'POST' && path === '/review/detail') {
         return await handleReviewDetail({ ...context, fetchImpl, runtime });
       }

@@ -69,6 +69,7 @@ test('overview sends Appwrite TablesDB JSON query objects', async () => {
   try {
     const calls = [];
     const handler = createHandler({
+      authorizeBooksCapability: async () => 'user-1',
       fetchImpl: async (url, init) => {
         calls.push({ init, url });
         const requestUrl = new URL(url);
@@ -142,6 +143,7 @@ test('maps an Appwrite overview failure to an upstream 502 instead of a generic 
   try {
     const logs = [];
     const handler = createHandler({
+      authorizeBooksCapability: async () => 'user-1',
       fetchImpl: async (url) => {
         const requestUrl = new URL(url);
         if (requestUrl.pathname === '/v1/account') {
@@ -180,6 +182,84 @@ test('maps an Appwrite overview failure to an upstream 502 instead of a generic 
     assert.deepEqual(logs, [
       'KeepFlip Books POST /overview failed with status 502. reason=APPWRITE_400',
     ]);
+  } finally {
+    restoreEnvironment(previous);
+  }
+});
+
+test('Books checks the JWT-backed subscription before loading protected data', async () => {
+  const environmentNames = [
+    'APPWRITE_BOOKS_DATABASE_ID',
+    'APPWRITE_FUNCTION_API_ENDPOINT',
+    'APPWRITE_FUNCTION_PROJECT_ID',
+    'APPWRITE_USER_SUBSCRIPTIONS_TABLE_ID',
+  ];
+  const previous = Object.fromEntries(
+    environmentNames.map((name) => [name, process.env[name]]),
+  );
+  Object.assign(process.env, {
+    APPWRITE_BOOKS_DATABASE_ID: 'keepflip',
+    APPWRITE_FUNCTION_API_ENDPOINT: 'https://appwrite.example/v1',
+    APPWRITE_FUNCTION_PROJECT_ID: 'keepflip',
+    APPWRITE_USER_SUBSCRIPTIONS_TABLE_ID: 'user_subscriptions',
+  });
+
+  try {
+    const calls = [];
+    const handler = createHandler({
+      now: () => '2026-09-09T12:00:00.000Z',
+      fetchImpl: async (url) => {
+        const requestUrl = new URL(url);
+        calls.push(requestUrl.pathname);
+        if (requestUrl.pathname === '/v1/account') {
+          return jsonResponse({ $id: 'user-1' });
+        }
+        if (
+          requestUrl.pathname ===
+          '/v1/tablesdb/keepflip/tables/user_subscriptions/rows/user-1'
+        ) {
+          return jsonResponse({
+            $id: 'user-1',
+            currentPeriodEndsAt: '2026-09-01T00:00:00.000Z',
+            ownerId: 'user-1',
+            plan: 'serious',
+            status: 'cancelled',
+          });
+        }
+        if (requestUrl.pathname.includes('/tables/trial_device_claims/rows/')) {
+          return jsonResponse({ message: 'Not found.' }, 404);
+        }
+        throw new Error(`Unexpected protected Books request: ${requestUrl.pathname}`);
+      },
+    });
+    const result = { body: null, status: null };
+    await handler({
+      req: {
+        headers: {
+          'x-appwrite-key': 'function-key',
+          'x-appwrite-user-jwt': 'user-jwt',
+        },
+        method: 'POST',
+        path: '/overview',
+      },
+      res: {
+        json(body, status = 200) {
+          result.body = body;
+          result.status = status;
+          return body;
+        },
+      },
+    });
+
+    assert.equal(result.status, 403);
+    assert.deepEqual(result.body, {
+      error: 'An active KeepFlip subscription with Books is required.',
+      ok: false,
+    });
+    assert.equal(
+      calls.some((path) => path.endsWith('/tables/book_journal_lines/rows')),
+      false,
+    );
   } finally {
     restoreEnvironment(previous);
   }
@@ -249,6 +329,7 @@ test('configured Books entrypoint serves the focused review detail route', async
 
   try {
     const handler = createHandler({
+      authorizeBooksCapability: async () => 'user-1',
       fetchImpl: async (url) => {
         const requestUrl = new URL(url);
         if (requestUrl.pathname === '/v1/account') {
@@ -339,6 +420,7 @@ test('review confirm falls back safely when eventStatus rejects review_confirmed
   try {
     const patches = [];
     const handler = createHandler({
+      authorizeBooksCapability: async () => 'user-1',
       fetchImpl: async (url, init = {}) => {
         const requestUrl = new URL(url);
         if (requestUrl.pathname === '/v1/account') {
