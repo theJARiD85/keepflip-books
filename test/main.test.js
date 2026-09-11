@@ -123,6 +123,108 @@ test('overview sends Appwrite TablesDB JSON query objects', async () => {
   }
 });
 
+test('review queue keeps legacy confirmed eBay imports available for linked posting', async () => {
+  const environmentNames = [
+    'APPWRITE_BOOKS_DATABASE_ID',
+    'APPWRITE_BOOK_SOURCE_EVENTS_TABLE_ID',
+    'APPWRITE_FUNCTION_API_ENDPOINT',
+    'APPWRITE_FUNCTION_PROJECT_ID',
+  ];
+  const previous = Object.fromEntries(
+    environmentNames.map((name) => [name, process.env[name]]),
+  );
+  Object.assign(process.env, {
+    APPWRITE_BOOKS_DATABASE_ID: 'keepflip',
+    APPWRITE_BOOK_SOURCE_EVENTS_TABLE_ID: 'book_source_events',
+    APPWRITE_FUNCTION_API_ENDPOINT: 'https://appwrite.example/v1',
+    APPWRITE_FUNCTION_PROJECT_ID: 'keepflip',
+  });
+
+  try {
+    const handler = createHandler({
+      authorizeBooksCapability: async () => 'user-1',
+      fetchImpl: async (url) => {
+        const requestUrl = new URL(url);
+        if (requestUrl.pathname === '/v1/account') {
+          return jsonResponse({ $id: 'user-1' });
+        }
+        assert.equal(
+          requestUrl.pathname,
+          '/v1/tablesdb/keepflip/tables/book_source_events/rows',
+        );
+        return jsonResponse({
+          rows: [
+            {
+              $id: 'review-confirmed',
+              amountCents: 2500,
+              currency: 'USD',
+              eventStatus: 'review_confirmed',
+              externalKey: 'ebay-legacy-confirmed',
+              occurredAt: '2026-09-10T12:00:00.000Z',
+              ownerId: 'user-1',
+              source: 'ebay_finances',
+              sourceType: 'fee',
+            },
+            {
+              $id: 'review-open',
+              amountCents: 1200,
+              currency: 'USD',
+              eventStatus: 'needs_review',
+              externalKey: 'ebay-open',
+              occurredAt: '2026-09-09T12:00:00.000Z',
+              ownerId: 'user-1',
+              source: 'ebay_finances',
+              sourceType: 'fee',
+            },
+            {
+              $id: 'review-posted',
+              amountCents: 500,
+              currency: 'USD',
+              eventStatus: 'posted',
+              externalKey: 'ebay-posted',
+              occurredAt: '2026-09-11T12:00:00.000Z',
+              ownerId: 'user-1',
+              source: 'ebay_finances',
+              sourceType: 'fee',
+            },
+          ],
+        });
+      },
+    });
+    const result = { body: null, status: null };
+    const res = {
+      json(body, status = 200) {
+        result.body = body;
+        result.status = status;
+        return body;
+      },
+    };
+
+    await handler({
+      req: {
+        headers: {
+          'x-appwrite-key': 'function-key',
+          'x-appwrite-user-jwt': 'user-jwt',
+        },
+        method: 'POST',
+        path: '/review/list',
+      },
+      res,
+    });
+
+    assert.equal(result.status, 200);
+    assert.deepEqual(
+      result.body.items.map(({ id, status }) => ({ id, status })),
+      [
+        { id: 'review-confirmed', status: 'review_confirmed' },
+        { id: 'review-open', status: 'needs_review' },
+      ],
+    );
+  } finally {
+    restoreEnvironment(previous);
+  }
+});
+
 test('maps an Appwrite overview failure to an upstream 502 instead of a generic 500', async () => {
   const environmentNames = [
     'APPWRITE_BOOKS_DATABASE_ID',
@@ -499,6 +601,151 @@ test('review confirm falls back safely when eventStatus rejects review_confirmed
     assert.match(
       patches[1].reviewReason,
       /^\[KEEPFLIP_REVIEW_CONFIRMED\]/,
+    );
+  } finally {
+    restoreEnvironment(previous);
+  }
+});
+
+test('review post creates one Books record tied to the imported eBay transaction ID', async () => {
+  const environmentNames = [
+    'APPWRITE_BOOKS_DATABASE_ID',
+    'APPWRITE_BOOK_ACCOUNTS_TABLE_ID',
+    'APPWRITE_BOOK_SOURCE_EVENTS_TABLE_ID',
+    'APPWRITE_BOOK_TRANSACTIONS_TABLE_ID',
+    'APPWRITE_BOOK_JOURNAL_LINES_TABLE_ID',
+    'APPWRITE_FUNCTION_API_ENDPOINT',
+    'APPWRITE_FUNCTION_PROJECT_ID',
+  ];
+  const previous = Object.fromEntries(
+    environmentNames.map((name) => [name, process.env[name]]),
+  );
+  Object.assign(process.env, {
+    APPWRITE_BOOKS_DATABASE_ID: 'keepflip',
+    APPWRITE_BOOK_ACCOUNTS_TABLE_ID: 'book_accounts',
+    APPWRITE_BOOK_SOURCE_EVENTS_TABLE_ID: 'book_source_events',
+    APPWRITE_BOOK_TRANSACTIONS_TABLE_ID: 'book_transactions',
+    APPWRITE_BOOK_JOURNAL_LINES_TABLE_ID: 'book_journal_lines',
+    APPWRITE_FUNCTION_API_ENDPOINT: 'https://appwrite.example/v1',
+    APPWRITE_FUNCTION_PROJECT_ID: 'keepflip',
+  });
+
+  try {
+    let stagedOperations = [];
+    const handler = createHandler({
+      authorizeBooksCapability: async () => 'user-1',
+      now: () => '2026-09-10T18:30:00.000Z',
+      fetchImpl: async (url, init = {}) => {
+        const requestUrl = new URL(url);
+        const method = init.method || 'GET';
+        if (requestUrl.pathname === '/v1/account') {
+          return jsonResponse({ $id: 'user-1' });
+        }
+        if (requestUrl.pathname.includes('/tables/book_source_events/rows/')) {
+          return jsonResponse({
+            $id: 'review-1',
+            amountCents: 1919,
+            bookingEntry: 'CREDIT',
+            currency: 'USD',
+            eventStatus: 'needs_review',
+            externalKey: 'ebay-transaction-1',
+            occurredAt: '2026-08-22T12:00:00.000Z',
+            ownerId: 'user-1',
+            rawTransactionType: 'CREDIT',
+            source: 'ebay_finances',
+            sourceType: 'credit_debit',
+          });
+        }
+        if (requestUrl.pathname.includes('/tables/book_transactions/rows/')) {
+          return jsonResponse({ message: 'Not found.' }, 404);
+        }
+        if (requestUrl.pathname.includes('/tables/book_accounts/rows/')) {
+          return jsonResponse({ message: 'Not found.' }, 404);
+        }
+        if (
+          requestUrl.pathname === '/v1/tablesdb/keepflip/tables/book_accounts/rows' &&
+          method === 'POST'
+        ) {
+          return jsonResponse({ $id: 'account' }, 201);
+        }
+        if (requestUrl.pathname === '/v1/tablesdb/transactions' && method === 'POST') {
+          return jsonResponse({ $id: 'transaction-1' }, 201);
+        }
+        if (
+          requestUrl.pathname === '/v1/tablesdb/transactions/transaction-1/operations' &&
+          method === 'POST'
+        ) {
+          stagedOperations = JSON.parse(init.body || '{}').operations || [];
+          return jsonResponse({});
+        }
+        if (
+          requestUrl.pathname === '/v1/tablesdb/transactions/transaction-1' &&
+          method === 'PATCH'
+        ) {
+          return jsonResponse({});
+        }
+        throw new Error(`Unexpected review post request: ${method} ${requestUrl.pathname}`);
+      },
+    });
+
+    const result = { body: null, status: null };
+    await handler({
+      req: {
+        bodyJson: {
+          amountCents: 1919,
+          bookingEntry: 'DEBIT',
+          currency: 'USD',
+          eventType: 'marketplace_fee',
+          // The client may send this field, but the review endpoint must ignore
+          // it and use the stored source identity instead.
+          externalKey: 'different-transaction-id',
+          occurredAt: '2026-08-22T12:00:00.000Z',
+          reviewId: 'review-1',
+          transactionMemo: 'Corrected eBay charge',
+          transactionType: 'NON_SALE_CHARGE',
+        },
+        headers: {
+          'x-appwrite-key': 'function-key',
+          'x-appwrite-user-jwt': 'user-jwt',
+        },
+        method: 'POST',
+        path: '/review/post',
+      },
+      res: {
+        json(body, status = 200) {
+          result.body = body;
+          result.status = status;
+          return body;
+        },
+      },
+    });
+
+    assert.equal(result.status, 200);
+    assert.equal(result.body?.ok, true);
+    assert.equal(result.body?.status, 'posted');
+    assert.ok(result.body?.bookTransactionId);
+
+    const transactionOperation = stagedOperations.find(
+      (operation) => operation.tableId === 'book_transactions',
+    );
+    const sourceOperation = stagedOperations.find(
+      (operation) => operation.tableId === 'book_source_events',
+    );
+    const journalOperations = stagedOperations.filter(
+      (operation) => operation.tableId === 'book_journal_lines',
+    );
+
+    assert.equal(transactionOperation?.data?.externalKey, 'ebay-transaction-1');
+    assert.equal(transactionOperation?.data?.source, 'ebay_finances');
+    assert.equal(sourceOperation?.data?.externalKey, 'ebay-transaction-1');
+    assert.equal(sourceOperation?.data?.eventStatus, 'posted');
+    assert.equal(sourceOperation?.data?.rawTransactionType, 'NON_SALE_CHARGE');
+    assert.equal(sourceOperation?.data?.bookingEntry, 'DEBIT');
+    assert.equal(journalOperations.length, 2);
+    assert.ok(
+      journalOperations.every(
+        (operation) => operation.data?.externalKey === 'ebay-transaction-1',
+      ),
     );
   } finally {
     restoreEnvironment(previous);

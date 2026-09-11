@@ -394,7 +394,7 @@ export function inventorySaleState(item, requestedQuantity = 1) {
   };
 }
 
-function itemUpdateForSale({
+export function itemUpdateForSale({
   externalKey,
   occurredAt,
   orderId,
@@ -437,7 +437,7 @@ async function getRowOrNull({ runtime, configuration, tableId, rowId, apiKey, fe
   }
 }
 
-async function getOwnedItem({ runtime, configuration, apiKey, ownerId, itemId, fetchImpl }) {
+export async function getOwnedItem({ runtime, configuration, apiKey, ownerId, itemId, fetchImpl }) {
   const row = await getRowOrNull({
     apiKey,
     configuration,
@@ -452,7 +452,7 @@ async function getOwnedItem({ runtime, configuration, apiKey, ownerId, itemId, f
   return row;
 }
 
-async function ensureBookAccounts({ runtime, configuration, apiKey, ownerId, now, fetchImpl }) {
+export async function ensureBookAccounts({ runtime, configuration, apiKey, ownerId, now, fetchImpl }) {
   for (const [accountKey, displayName, accountType] of BOOK_ACCOUNT_SEEDS) {
     const accountCode = BOOK_ACCOUNT[accountKey];
     const rowId = accountRowId(ownerId, accountCode);
@@ -584,6 +584,16 @@ async function recordReviewEvent({ runtime, configuration, apiKey, ownerId, even
     tableId: configuration.sourceEventsTableId,
   });
   if (existing) {
+    // A seller may have deliberately corrected an eBay import and posted the
+    // resulting Books entry through the review workflow. A later provider
+    // sync must never turn that durable, user-confirmed record back into an
+    // open review merely because the original eBay shape remains unsupported.
+    if (
+      text(existing?.source, 80) === 'ebay_finances' &&
+      text(existing?.eventStatus, 40) === 'posted'
+    ) {
+      return { status: 'already_recorded' };
+    }
     await appwriteJson({
       apiKey,
       body: { data },
@@ -625,7 +635,7 @@ export function sourceEventPersistenceOperation({
   };
 }
 
-async function persistEntry({
+export async function persistEntry({
   runtime,
   configuration,
   apiKey,
@@ -637,6 +647,7 @@ async function persistEntry({
   orderId,
   payoutId,
   payoutStatus,
+  sourceEventPatch,
   fetchImpl,
   now,
 }) {
@@ -675,10 +686,11 @@ async function persistEntry({
     reversesTransactionId: null,
     source,
   };
-  const sourceData = sourceEventData({
-    amountCents: entry.amountCents,
-    currency: entry.currency,
-    eventStatus: sourceEventStatus,
+  const sourceData = {
+    ...sourceEventData({
+      amountCents: entry.amountCents,
+      currency: entry.currency,
+      eventStatus: sourceEventStatus,
     externalKey,
     itemId: entry.itemId,
     now,
@@ -697,9 +709,13 @@ async function persistEntry({
       source,
     }),
     payoutId,
-    source,
-    sourceType: entry.eventType,
-  });
+      source,
+      sourceType: entry.eventType,
+    }),
+    ...(sourceEventPatch && typeof sourceEventPatch === 'object'
+      ? sourceEventPatch
+      : {}),
+  };
   const operations = [
     {
       action: 'create',

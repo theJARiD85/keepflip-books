@@ -1,6 +1,16 @@
 import { createHash } from 'node:crypto';
 
-import { BOOK_ACCOUNT } from './bookkeeping-domain.js';
+import {
+  BOOK_ACCOUNT,
+  BookkeepingValidationError,
+  postBookkeepingEvent,
+} from './bookkeeping-domain.js';
+import {
+  ensureBookAccounts,
+  getOwnedItem,
+  itemUpdateForSale,
+  persistEntry,
+} from './main-core.js';
 import {
   createHandler as createExistingHandler,
   reviewItemForRow,
@@ -12,6 +22,24 @@ const OPEN_REVIEW_STATUSES = new Set([
   'needs_review',
 ]);
 const CONFIRMED_REVIEW_PREFIX = '[KEEPFLIP_REVIEW_CONFIRMED]';
+const REVIEW_POSTING_EVENT_TYPES = new Set([
+  'advertising',
+  'inventory_purchase',
+  'marketplace_credit',
+  'marketplace_fee',
+  'mileage',
+  'other_expense',
+  'payout',
+  'refund',
+  'repair_parts',
+  'sale',
+  'shipping_label',
+  'software',
+  'storage',
+  'supplies',
+]);
+const DEBIT_OR_CREDIT = new Set(['DEBIT', 'CREDIT']);
+const REVIEW_MAX_QUANTITY = 100_000;
 
 // Keep the Books policy local to this deployment. Appwrite Functions run as
 // isolated packages, so a protected Books request must not rely on a nested
@@ -23,6 +51,7 @@ const BOOKS_CAPABILITY_BY_PATH = new Map([
   ['/review/detail', 'basic_books'],
   ['/review/resolve', 'basic_books'],
   ['/review/confirm', 'basic_books'],
+  ['/review/post', 'basic_books'],
   ['/ebay/sync', 'automated_books'],
 ]);
 
@@ -109,9 +138,11 @@ function runtimeConfiguration() {
 function tableConfiguration() {
   return {
     databaseId: firstEnvironment(['APPWRITE_BOOKS_DATABASE_ID', 'APPWRITE_DATABASE_ID'], 'keepflip'),
+    accountsTableId: firstEnvironment(['APPWRITE_BOOK_ACCOUNTS_TABLE_ID'], 'book_accounts'),
     sourceEventsTableId: firstEnvironment(['APPWRITE_BOOK_SOURCE_EVENTS_TABLE_ID'], 'book_source_events'),
     transactionsTableId: firstEnvironment(['APPWRITE_BOOK_TRANSACTIONS_TABLE_ID'], 'book_transactions'),
     journalLinesTableId: firstEnvironment(['APPWRITE_BOOK_JOURNAL_LINES_TABLE_ID'], 'book_journal_lines'),
+    payoutsTableId: firstEnvironment(['APPWRITE_BOOK_PAYOUTS_TABLE_ID'], 'book_payouts'),
     itemsTableId: firstEnvironment(['APPWRITE_BOOK_ITEMS_TABLE_ID', 'APPWRITE_ITEMS_TABLE_ID'], 'items'),
     subscriptionsTableId: firstEnvironment(['APPWRITE_USER_SUBSCRIPTIONS_TABLE_ID'], 'user_subscriptions'),
     trialClaimsTableId: firstEnvironment(['APPWRITE_TRIAL_DEVICE_CLAIMS_TABLE_ID'], 'trial_device_claims'),
@@ -345,6 +376,68 @@ function normalizedCurrency(value, fallback = '') {
   return currency;
 }
 
+function positiveCents(value, field) {
+  const amount = nonNegativeCents(value, field);
+  if (amount === 0) {
+    throw new ReviewHttpError(
+      400,
+      `${field} must be greater than zero before KeepFlip can create a Books record.`,
+    );
+  }
+  return amount;
+}
+
+function reviewPostingEventType(value) {
+  const eventType = text(value, 60).toLowerCase();
+  if (!REVIEW_POSTING_EVENT_TYPES.has(eventType)) {
+    throw new ReviewHttpError(
+      400,
+      'Choose how this transaction should be recorded before creating the Books record.',
+    );
+  }
+  return eventType;
+}
+
+function reviewedDate(value) {
+  const date = new Date(text(value, 80));
+  if (!Number.isFinite(date.getTime())) {
+    throw new ReviewHttpError(400, 'Transaction date and time must be a real date.');
+  }
+  return date.toISOString();
+}
+
+function reviewedBookingEntry(value) {
+  const bookingEntry = text(value, 32).toUpperCase();
+  if (!bookingEntry) return null;
+  if (!DEBIT_OR_CREDIT.has(bookingEntry)) {
+    throw new ReviewHttpError(400, 'Booking entry must be DEBIT, CREDIT, or left blank.');
+  }
+  return bookingEntry;
+}
+
+function reviewedTransactionType(value, fallback) {
+  const transactionType = text(value, 80).toUpperCase() || text(fallback, 80).toUpperCase();
+  if (!transactionType) {
+    throw new ReviewHttpError(400, 'Enter the transaction type before creating the Books record.');
+  }
+  return transactionType;
+}
+
+function reviewedQuantity(value) {
+  const quantity = value == null || value === '' ? 1 : Number(value);
+  if (
+    !Number.isSafeInteger(quantity) ||
+    quantity < 1 ||
+    quantity > REVIEW_MAX_QUANTITY
+  ) {
+    throw new ReviewHttpError(
+      400,
+      `Quantity must be a whole number from 1 through ${REVIEW_MAX_QUANTITY.toLocaleString()}.`,
+    );
+  }
+  return quantity;
+}
+
 function storedReviewReason(row) {
   const reason = text(row?.reviewReason, 1_000);
   return reason.startsWith(CONFIRMED_REVIEW_PREFIX)
@@ -367,7 +460,7 @@ function fallbackConfirmedReviewReason(row) {
   return `${CONFIRMED_REVIEW_PREFIX} ${reason}`.slice(0, 1_000);
 }
 
-function reviewDetailForRow(row, item = null) {
+function reviewDetailForRow(row, item = null, bookTransaction = null) {
   const base = reviewItemForRow(row);
   const storedReason = storedReviewReason(row);
   const fallbackConfirmed = isFallbackConfirmedReviewRow(row);
@@ -381,6 +474,7 @@ function reviewDetailForRow(row, item = null) {
     reason: storedReason || base.reason,
     reviewUpdatedAt: text(row?.reviewUpdatedAt, 80) || null,
     transactionMemo: text(row?.transactionMemo, 1_000) || null,
+    bookTransactionId: bookTransaction ? text(bookTransaction?.$id, 64) || null : null,
     item: item
       ? {
           id: text(item?.$id, 64),
@@ -431,6 +525,29 @@ async function loadReviewItem({ runtime, configuration, apiKey, ownerId, reviewR
   return item && ownerIdFromRow(item) === ownerId ? item : null;
 }
 
+async function loadReviewBookTransaction({
+  runtime,
+  configuration,
+  apiKey,
+  ownerId,
+  reviewRow,
+  fetchImpl,
+}) {
+  const externalKey = text(reviewRow?.externalKey, 255);
+  if (!externalKey) return null;
+  const bookTransaction = await getRowOrNull({
+    apiKey,
+    configuration,
+    fetchImpl,
+    rowId: transactionRowId(ownerId, 'ebay_finances', externalKey),
+    runtime,
+    tableId: configuration.transactionsTableId,
+  });
+  return bookTransaction && ownerIdFromRow(bookTransaction) === ownerId
+    ? bookTransaction
+    : null;
+}
+
 async function handleReviewList({ req, res, runtime, fetchImpl }) {
   const ownerId = await authenticatedUserId({ fetchImpl, req, runtime });
   const apiKey = dynamicApiKey(req);
@@ -447,11 +564,18 @@ async function handleReviewList({ req, res, runtime, fetchImpl }) {
   });
   const rows = Array.isArray(payload?.rows) ? payload.rows : [];
   const items = rows
-    .filter(
-      (row) =>
-        OPEN_REVIEW_STATUSES.has(text(row?.eventStatus, 40)) &&
-        !isFallbackConfirmedReviewRow(row),
-    )
+    .filter((row) => {
+      const eventStatus = text(row?.eventStatus, 40);
+      const recoverableConfirmedEbayImport =
+        text(row?.source, 80) === 'ebay_finances' &&
+        (eventStatus === 'review_confirmed' || isFallbackConfirmedReviewRow(row));
+
+      // Earlier Function versions treated a review confirmation as completion,
+      // even though they did not create a Books transaction or journal lines.
+      // Keep those legacy eBay imports reachable so the user can post one
+      // linked, idempotent Books record after checking its details.
+      return OPEN_REVIEW_STATUSES.has(eventStatus) || recoverableConfirmedEbayImport;
+    })
     .sort((left, right) => {
       const leftTime = Date.parse(text(left?.occurredAt, 64)) || 0;
       const rightTime = Date.parse(text(right?.occurredAt, 64)) || 0;
@@ -468,13 +592,20 @@ async function handleReviewList({ req, res, runtime, fetchImpl }) {
 
 async function handleReviewDetail({ req, res, runtime, fetchImpl }) {
   const loaded = await loadOwnedReview({ fetchImpl, req, runtime });
-  const item = await loadReviewItem({
-    ...loaded,
-    fetchImpl,
-    runtime,
-  });
+  const [item, bookTransaction] = await Promise.all([
+    loadReviewItem({
+      ...loaded,
+      fetchImpl,
+      runtime,
+    }),
+    loadReviewBookTransaction({
+      ...loaded,
+      fetchImpl,
+      runtime,
+    }),
+  ]);
   return res.json({
-    item: reviewDetailForRow(loaded.reviewRow, item),
+    item: reviewDetailForRow(loaded.reviewRow, item, bookTransaction),
     ok: true,
   });
 }
@@ -838,6 +969,178 @@ async function confirmGeneralReview({ loaded, runtime, fetchImpl, now }) {
   };
 }
 
+function reviewPostingSummary(eventType) {
+  return `Reviewed eBay ${eventType.replace(/_/g, ' ')}`;
+}
+
+async function postReviewedEbayRecord({ loaded, runtime, fetchImpl, now }) {
+  const { apiKey, body, configuration, ownerId, reviewRow } = loaded;
+  const source = text(reviewRow?.source, 80);
+  if (source !== 'ebay_finances') {
+    throw new ReviewHttpError(409, 'Only imported eBay transactions can be posted from this review.');
+  }
+
+  const externalKey = text(reviewRow?.externalKey, 255);
+  if (!externalKey) {
+    throw new ReviewHttpError(409, 'This eBay import has no transaction ID to link to a Books record.');
+  }
+
+  const status = isFallbackConfirmedReviewRow(reviewRow)
+    ? 'review_confirmed'
+    : text(reviewRow?.eventStatus, 40);
+  if (status === 'needs_item_cost') {
+    throw new ReviewHttpError(
+      409,
+      'This sale already has a Books record. Confirm its original item cost instead of rewriting the posted sale.',
+    );
+  }
+  if (!['needs_item_match', 'needs_review', 'review_confirmed'].includes(status)) {
+    throw new ReviewHttpError(409, 'That transaction can no longer be posted from review.');
+  }
+
+  const existingTransaction = await loadReviewBookTransaction({
+    ...loaded,
+    fetchImpl,
+    runtime,
+  });
+  if (existingTransaction) {
+    return {
+      alreadyRecorded: true,
+      bookTransactionId: text(existingTransaction.$id, 64),
+      status: 'posted',
+    };
+  }
+
+  const eventType = reviewPostingEventType(body.eventType);
+  const amountCents = positiveCents(body.amountCents, 'Transaction amount');
+  const currency = normalizedCurrency(body.currency, reviewRow?.currency);
+  const occurredAt = reviewedDate(body.occurredAt || reviewRow?.occurredAt);
+  const transactionType = reviewedTransactionType(
+    body.transactionType,
+    reviewRow?.rawTransactionType || reviewRow?.sourceType,
+  );
+  const bookingEntry = reviewedBookingEntry(body.bookingEntry);
+  const orderId = text(body.orderId, 180) || null;
+  const requestedPayoutId = text(body.payoutId, 180) || null;
+  const payoutId = eventType === 'payout' ? requestedPayoutId || externalKey : requestedPayoutId;
+  const transactionMemo = text(body.transactionMemo, 1_000) || null;
+  const requestedItemId = text(body.itemId, 64) || null;
+  let entry;
+  let itemUpdate;
+
+  try {
+    if (eventType === 'sale') {
+      if (!requestedItemId) {
+        throw new ReviewHttpError(400, 'Choose the KeepFlip inventory item that actually sold.');
+      }
+      const item = await getOwnedItem({
+        apiKey,
+        configuration,
+        fetchImpl,
+        itemId: requestedItemId,
+        ownerId,
+        runtime,
+      });
+      const sale = inventorySaleState(item, reviewedQuantity(body.quantity));
+      entry = postBookkeepingEvent({
+        costCents: sale.costCents,
+        currency,
+        eventType,
+        feeCents: nonNegativeCents(body.feeCents ?? 0, 'Marketplace fees'),
+        grossSaleCents: amountCents,
+        itemId: requestedItemId,
+        marketplaceCollectedTaxCents: nonNegativeCents(
+          body.marketplaceCollectedTaxCents ?? 0,
+          'Marketplace-collected tax',
+        ),
+        notes: transactionMemo,
+        occurredAt,
+        sourceKey: `ebay_finances:reviewed:${externalKey}`,
+        summary: reviewPostingSummary(eventType),
+      });
+      itemUpdate = itemUpdateForSale({
+        externalKey,
+        occurredAt,
+        orderId,
+        ownerId,
+        sale,
+        source,
+        now,
+      });
+    } else {
+      if (eventType === 'inventory_purchase' && !requestedItemId) {
+        throw new ReviewHttpError(400, 'Choose the KeepFlip inventory item for this purchase.');
+      }
+      if (requestedItemId) {
+        await getOwnedItem({
+          apiKey,
+          configuration,
+          fetchImpl,
+          itemId: requestedItemId,
+          ownerId,
+          runtime,
+        });
+      }
+      entry = postBookkeepingEvent({
+        amountCents,
+        currency,
+        eventType,
+        itemId: requestedItemId,
+        notes: transactionMemo,
+        occurredAt,
+        sourceKey: `ebay_finances:reviewed:${externalKey}`,
+        summary: reviewPostingSummary(eventType),
+      });
+      if (eventType === 'inventory_purchase' && requestedItemId) {
+        itemUpdate = {
+          bookPurchaseTransactionId: transactionRowId(ownerId, source, externalKey),
+          updatedAt: now,
+        };
+      }
+    }
+  } catch (error) {
+    if (error instanceof ReviewHttpError) throw error;
+    if (error instanceof BookkeepingValidationError) {
+      throw new ReviewHttpError(400, error.message);
+    }
+    throw error;
+  }
+
+  await ensureBookAccounts({ apiKey, configuration, fetchImpl, now, ownerId, runtime });
+  const result = await persistEntry({
+    apiKey,
+    configuration,
+    entry,
+    externalKey,
+    fetchImpl,
+    itemUpdate,
+    now,
+    orderId,
+    ownerId,
+    payoutId,
+    runtime,
+    source,
+    sourceEventPatch: {
+      bookingEntry,
+      rawTransactionType: transactionType,
+      reviewReason: `User corrected and posted this eBay import as ${eventType.replace(/_/g, ' ')}.`,
+      reviewUpdatedAt: now,
+      transactionMemo,
+    },
+  });
+  return {
+    alreadyRecorded: result.status === 'already_recorded',
+    bookTransactionId: result.bookTransactionId,
+    status: result.status,
+  };
+}
+
+async function handleReviewPost({ req, res, runtime, fetchImpl, now }) {
+  const loaded = await loadOwnedReview({ fetchImpl, req, runtime });
+  const result = await postReviewedEbayRecord({ fetchImpl, loaded, now, runtime });
+  return res.json({ ...result, ok: true });
+}
+
 async function handleReviewConfirm({ req, res, runtime, fetchImpl, now }) {
   const loaded = await loadOwnedReview({ fetchImpl, req, runtime });
   if (isFallbackConfirmedReviewRow(loaded.reviewRow)) {
@@ -983,6 +1286,10 @@ export function createHandler(options = {}) {
       if (method === 'POST' && path === '/review/confirm') {
         const now = new Date(nowProvider()).toISOString();
         return await handleReviewConfirm({ ...context, fetchImpl, now, runtime });
+      }
+      if (method === 'POST' && path === '/review/post') {
+        const now = new Date(nowProvider()).toISOString();
+        return await handleReviewPost({ ...context, fetchImpl, now, runtime });
       }
       if (method === 'POST' && path === '/ebay/sync') {
         let snapshots = [];
