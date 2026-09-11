@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   createHandler,
+  findInvalidTransactionReplacement,
   inventorySaleState,
   isSyncEligibleEbayConnection,
 } from '../src/main.js';
@@ -121,6 +122,53 @@ test('overview sends Appwrite TablesDB JSON query objects', async () => {
   } finally {
     restoreEnvironment(previous);
   }
+});
+
+test('invalid eBay placeholders resolve only to one independently matching corrected transaction', () => {
+  const row = {
+    amountCents: 1919,
+    currency: 'USD',
+    externalKey: 'invalid-transaction-aaaaaaaaaaaaaaaaaaaaaaaa',
+    occurredAt: '2026-09-10T12:00:00.000Z',
+    orderId: 'order-1',
+    rawTransactionType: 'SALE',
+    source: 'ebay_finances',
+    sourceType: 'sale',
+  };
+  const corrected = {
+    amount: { currency: 'USD', value: '19.19' },
+    bookingEntry: 'CREDIT',
+    orderId: 'order-1',
+    totalFeeBasisAmount: { currency: 'USD', value: '19.19' },
+    transactionDate: '2026-09-10T12:00:00.000Z',
+    transactionId: 'txn-1',
+    transactionType: 'SALE',
+  };
+
+  assert.equal(
+    findInvalidTransactionReplacement(
+      row,
+      [corrected],
+      '2026-09-10T18:30:00.000Z',
+    ),
+    corrected,
+  );
+  assert.equal(
+    findInvalidTransactionReplacement(
+      row,
+      [corrected, { ...corrected, transactionId: 'txn-2' }],
+      '2026-09-10T18:30:00.000Z',
+    ),
+    null,
+  );
+  assert.equal(
+    findInvalidTransactionReplacement(
+      { ...row, externalKey: 'real-transaction-id' },
+      [corrected],
+      '2026-09-10T18:30:00.000Z',
+    ),
+    null,
+  );
 });
 
 test('review queue keeps legacy confirmed eBay imports available for linked posting', async () => {
@@ -747,6 +795,137 @@ test('review post creates one Books record tied to the imported eBay transaction
         (operation) => operation.data?.externalKey === 'ebay-transaction-1',
       ),
     );
+  } finally {
+    restoreEnvironment(previous);
+  }
+});
+
+test('correcting a synthetic eBay review replaces the placeholder source row', async () => {
+  const environmentNames = [
+    'APPWRITE_BOOKS_DATABASE_ID',
+    'APPWRITE_BOOK_ACCOUNTS_TABLE_ID',
+    'APPWRITE_BOOK_SOURCE_EVENTS_TABLE_ID',
+    'APPWRITE_BOOK_TRANSACTIONS_TABLE_ID',
+    'APPWRITE_BOOK_JOURNAL_LINES_TABLE_ID',
+    'APPWRITE_FUNCTION_API_ENDPOINT',
+    'APPWRITE_FUNCTION_PROJECT_ID',
+  ];
+  const previous = Object.fromEntries(
+    environmentNames.map((name) => [name, process.env[name]]),
+  );
+  Object.assign(process.env, {
+    APPWRITE_BOOKS_DATABASE_ID: 'keepflip',
+    APPWRITE_BOOK_ACCOUNTS_TABLE_ID: 'book_accounts',
+    APPWRITE_BOOK_SOURCE_EVENTS_TABLE_ID: 'book_source_events',
+    APPWRITE_BOOK_TRANSACTIONS_TABLE_ID: 'book_transactions',
+    APPWRITE_BOOK_JOURNAL_LINES_TABLE_ID: 'book_journal_lines',
+    APPWRITE_FUNCTION_API_ENDPOINT: 'https://appwrite.example/v1',
+    APPWRITE_FUNCTION_PROJECT_ID: 'keepflip',
+  });
+
+  try {
+    let stagedOperations = [];
+    let deletedReviewRow = false;
+    const handler = createHandler({
+      authorizeBooksCapability: async () => 'user-1',
+      now: () => '2026-09-10T18:30:00.000Z',
+      fetchImpl: async (url, init = {}) => {
+        const requestUrl = new URL(url);
+        const method = init.method || 'GET';
+        if (requestUrl.pathname === '/v1/account') {
+          return jsonResponse({ $id: 'user-1' });
+        }
+        if (requestUrl.pathname.endsWith('/book_source_events/rows/review-invalid')) {
+          if (method === 'DELETE') {
+            deletedReviewRow = true;
+            return jsonResponse({});
+          }
+          return jsonResponse({
+            $id: 'review-invalid',
+            amountCents: 1919,
+            bookingEntry: 'CREDIT',
+            currency: 'USD',
+            eventStatus: 'needs_review',
+            externalKey: 'invalid-transaction-aaaaaaaaaaaaaaaaaaaaaaaa',
+            occurredAt: '2026-08-22T12:00:00.000Z',
+            ownerId: 'user-1',
+            rawTransactionType: 'SALE',
+            source: 'ebay_finances',
+            sourceType: 'sale',
+          });
+        }
+        if (requestUrl.pathname.includes('/tables/book_source_events/rows/')) {
+          return jsonResponse({ message: 'Not found.' }, 404);
+        }
+        if (requestUrl.pathname.includes('/tables/book_transactions/rows/')) {
+          return jsonResponse({ message: 'Not found.' }, 404);
+        }
+        if (requestUrl.pathname.includes('/tables/book_accounts/rows/')) {
+          return jsonResponse({ message: 'Not found.' }, 404);
+        }
+        if (
+          requestUrl.pathname === '/v1/tablesdb/keepflip/tables/book_accounts/rows' &&
+          method === 'POST'
+        ) {
+          return jsonResponse({ $id: 'account' }, 201);
+        }
+        if (requestUrl.pathname === '/v1/tablesdb/transactions' && method === 'POST') {
+          return jsonResponse({ $id: 'transaction-corrected' }, 201);
+        }
+        if (
+          requestUrl.pathname === '/v1/tablesdb/transactions/transaction-corrected/operations' &&
+          method === 'POST'
+        ) {
+          stagedOperations = JSON.parse(init.body || '{}').operations || [];
+          return jsonResponse({});
+        }
+        if (
+          requestUrl.pathname === '/v1/tablesdb/transactions/transaction-corrected' &&
+          method === 'PATCH'
+        ) {
+          return jsonResponse({});
+        }
+        throw new Error(`Unexpected synthetic review request: ${method} ${requestUrl.pathname}`);
+      },
+    });
+
+    const result = { body: null, status: null };
+    await handler({
+      req: {
+        bodyJson: {
+          amountCents: 1919,
+          bookingEntry: 'CREDIT',
+          currency: 'USD',
+          eventType: 'marketplace_credit',
+          replacementExternalKey: 'txn-corrected',
+          occurredAt: '2026-08-22T12:00:00.000Z',
+          reviewId: 'review-invalid',
+          transactionType: 'CREDIT',
+        },
+        headers: {
+          'x-appwrite-key': 'function-key',
+          'x-appwrite-user-jwt': 'user-jwt',
+        },
+        method: 'POST',
+        path: '/review/post',
+      },
+      res: {
+        json(body, status = 200) {
+          result.body = body;
+          result.status = status;
+          return body;
+        },
+      },
+    });
+
+    assert.equal(result.status, 200);
+    assert.equal(result.body?.ok, true);
+    assert.equal(result.body?.replacedInvalidReview, true);
+    assert.equal(deletedReviewRow, true);
+    const transactionOperation = stagedOperations.find(
+      (operation) => operation.tableId === 'book_transactions',
+    );
+    assert.equal(transactionOperation?.data?.externalKey, 'txn-corrected');
   } finally {
     restoreEnvironment(previous);
   }

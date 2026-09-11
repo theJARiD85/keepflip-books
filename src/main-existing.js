@@ -1,6 +1,7 @@
 import { createDecipheriv, createHash } from 'node:crypto';
 
 import {
+  isSyntheticInvalidTransactionExternalKey,
   parseEbayFinanceTransaction,
   parseEbayPayout,
 } from './bookkeeping-domain.js';
@@ -396,6 +397,84 @@ function transactionMatch(raw, now) {
   };
 }
 
+function transactionTypeFromSourceType(value) {
+  const normalized = text(value, 80)
+    .toLowerCase()
+    .replace(/_foreign_currency$/, '');
+  if (normalized === 'sale' || normalized.startsWith('sale_')) return 'SALE';
+  if (normalized === 'credit' || normalized.startsWith('credit_')) return 'CREDIT';
+  if (normalized.startsWith('non_sale_charge')) return 'NON_SALE_CHARGE';
+  if (normalized.startsWith('shipping_label')) return 'SHIPPING_LABEL';
+  if (normalized.startsWith('refund')) return 'REFUND';
+  return '';
+}
+
+function finiteDate(value) {
+  const time = Date.parse(text(value, 80));
+  return Number.isFinite(time) ? time : null;
+}
+
+function replacementEvidence(row, raw, now) {
+  const transactionId = text(raw?.transactionId, 180);
+  const transactionType = text(raw?.transactionType, 80).toUpperCase();
+  const transactionDate = finiteDate(raw?.transactionDate);
+  if (!transactionId || !transactionType || transactionDate == null) return 0;
+
+  let evidence = 0;
+  const rowOrderId = text(row?.orderId, 180);
+  const rawOrderId = text(raw?.orderId, 180);
+  if (rowOrderId || rawOrderId) {
+    if (!rowOrderId || !rawOrderId || rowOrderId !== rawOrderId) return -1;
+    evidence += 1;
+  }
+
+  const rowTransactionType = text(row?.rawTransactionType, 80).toUpperCase();
+  const expectedTransactionType =
+    rowTransactionType || transactionTypeFromSourceType(row?.sourceType);
+  if (expectedTransactionType) {
+    if (expectedTransactionType !== transactionType) return -1;
+    evidence += 1;
+  }
+
+  const parsed = parseEbayFinanceTransaction(raw, { fallbackOccurredAt: now });
+  const parsedMoney = amountForParsed(parsed);
+  const rowAmount = Number(row?.amountCents);
+  const rowCurrency = text(row?.currency, 8).toUpperCase();
+  if (
+    Number.isSafeInteger(rowAmount) &&
+    rowAmount >= 0 &&
+    /^[A-Z]{3}$/.test(rowCurrency) &&
+    Number.isSafeInteger(parsedMoney.amountCents) &&
+    /^[A-Z]{3}$/.test(parsedMoney.currency)
+  ) {
+    if (rowAmount !== parsedMoney.amountCents || rowCurrency !== parsedMoney.currency) {
+      return -1;
+    }
+    evidence += 1;
+  }
+
+  const rowDate = finiteDate(row?.occurredAt);
+  const nowDate = finiteDate(now);
+  // A transaction with no date is stored with the sync clock as a safe
+  // fallback. Do not treat that fallback as proof that it is the replacement.
+  const rowDateLooksLikeFallback =
+    rowDate != null && nowDate != null && Math.abs(rowDate - nowDate) <= 5 * 60 * 1_000;
+  if (rowDate != null && rowDate === transactionDate && !rowDateLooksLikeFallback) {
+    evidence += 1;
+  }
+
+  return evidence >= 2 ? evidence : 0;
+}
+
+export function findInvalidTransactionReplacement(row, transactions, now) {
+  if (!isSyntheticInvalidTransactionExternalKey(row?.externalKey)) return null;
+  const matches = (Array.isArray(transactions) ? transactions : [])
+    .map((raw) => ({ raw, score: replacementEvidence(row, raw, now) }))
+    .filter(({ score }) => score > 0)
+    .sort((left, right) => right.score - left.score);
+  return matches.length === 1 ? matches[0].raw : null;
+}
+
 function payoutMatch(raw, now) {
   const parsed = parseEbayPayout(raw, { fallbackOccurredAt: now });
   const moneyAudit = rawMoneyAudit(raw, null);
@@ -439,6 +518,23 @@ async function patchSourceRow({ runtime, configuration, apiKey, rowId, data, fet
       failureMessage: 'KeepFlip could not update the eBay source audit record.',
       fetchImpl,
       method: 'PATCH',
+      path: rowPath(configuration, configuration.sourceEventsTableId, rowId),
+      runtime,
+    });
+    return true;
+  } catch (error) {
+    if (error instanceof RepairUpstreamError && error.status === 404) return false;
+    throw error;
+  }
+}
+
+async function deleteSourceRow({ runtime, configuration, apiKey, rowId, fetchImpl }) {
+  try {
+    await appwriteJson({
+      apiKey,
+      failureMessage: 'KeepFlip could not remove the replaced invalid eBay review record.',
+      fetchImpl,
+      method: 'DELETE',
       path: rowPath(configuration, configuration.sourceEventsTableId, rowId),
       runtime,
     });
@@ -513,6 +609,36 @@ async function auditAndRepair({
     ownerId,
     runtime,
   });
+  const invalidRows = afterAuditRows.filter((row) =>
+    isSyntheticInvalidTransactionExternalKey(row?.externalKey) &&
+    text(row?.source, 80) === 'ebay_finances' &&
+    REVIEW_STATUSES.has(text(row?.eventStatus, 40)),
+  );
+  const correctedExternalKeys = new Set();
+  let invalidRepaired = 0;
+  for (const row of invalidRows) {
+    const replacement = findInvalidTransactionReplacement(row, transactions, now);
+    const replacementExternalKey = text(replacement?.transactionId, 180);
+    if (!replacementExternalKey || correctedExternalKeys.has(replacementExternalKey)) continue;
+    const correctedRow = afterAuditRows.find(
+      (candidate) =>
+        text(candidate?.source, 80) === 'ebay_finances' &&
+        text(candidate?.externalKey, 255) === replacementExternalKey,
+    );
+    // The corrected source must already exist before its placeholder can be
+    // removed. This keeps a failed or partial sync reviewable and recoverable.
+    if (!correctedRow) continue;
+    correctedExternalKeys.add(replacementExternalKey);
+    if (await deleteSourceRow({
+      apiKey,
+      configuration,
+      fetchImpl,
+      rowId: text(row?.$id, 64),
+      runtime,
+    })) {
+      invalidRepaired += 1;
+    }
+  }
   const remainingLegacy = afterAuditRows.filter(isLegacyReviewRow);
   const auditStart = Date.parse(start);
   const auditEnd = Date.parse(end);
@@ -565,6 +691,7 @@ async function auditAndRepair({
   }
 
   return {
+    invalidRepaired,
     legacyArchived: archivedIds.size,
     legacyDeferred: remainingLegacyIds.size,
     legacyRepaired: repaired,

@@ -4,6 +4,7 @@ export {
 } from './main-v2.js';
 
 export {
+  findInvalidTransactionReplacement,
   inventorySaleState,
   isSyncEligibleEbayConnection,
   reviewItemForRow,

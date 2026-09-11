@@ -63,6 +63,10 @@ function invalidEbayExternalId(source, kind) {
   return `invalid-${kind}-${digest}`;
 }
 
+export function isSyntheticInvalidTransactionExternalKey(value) {
+  return /^invalid-transaction-[a-f0-9]{24}$/i.test(text(value, 255));
+}
+
 export function assertCents(value, label = 'Amount') {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new BookkeepingValidationError(

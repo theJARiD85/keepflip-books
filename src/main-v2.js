@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import {
   BOOK_ACCOUNT,
   BookkeepingValidationError,
+  isSyntheticInvalidTransactionExternalKey,
   postBookkeepingEvent,
 } from './bookkeeping-domain.js';
 import {
@@ -531,9 +532,10 @@ async function loadReviewBookTransaction({
   apiKey,
   ownerId,
   reviewRow,
+  externalKey: externalKeyOverride,
   fetchImpl,
 }) {
-  const externalKey = text(reviewRow?.externalKey, 255);
+  const externalKey = text(externalKeyOverride, 255) || text(reviewRow?.externalKey, 255);
   if (!externalKey) return null;
   const bookTransaction = await getRowOrNull({
     apiKey,
@@ -546,6 +548,24 @@ async function loadReviewBookTransaction({
   return bookTransaction && ownerIdFromRow(bookTransaction) === ownerId
     ? bookTransaction
     : null;
+}
+
+async function deleteReviewSourceRow({ loaded, fetchImpl, runtime }) {
+  const { apiKey, configuration, reviewId } = loaded;
+  try {
+    await appwriteJson({
+      apiKey,
+      failureMessage: 'KeepFlip could not remove the replaced invalid eBay review record.',
+      fetchImpl,
+      method: 'DELETE',
+      path: rowPath(configuration, configuration.sourceEventsTableId, reviewId),
+      runtime,
+    });
+    return true;
+  } catch (error) {
+    if (error instanceof ReviewUpstreamError && error.status === 404) return false;
+    throw error;
+  }
 }
 
 async function handleReviewList({ req, res, runtime, fetchImpl }) {
@@ -980,10 +1000,21 @@ async function postReviewedEbayRecord({ loaded, runtime, fetchImpl, now }) {
     throw new ReviewHttpError(409, 'Only imported eBay transactions can be posted from this review.');
   }
 
-  const externalKey = text(reviewRow?.externalKey, 255);
-  if (!externalKey) {
+  const importedExternalKey = text(reviewRow?.externalKey, 255);
+  if (!importedExternalKey) {
     throw new ReviewHttpError(409, 'This eBay import has no transaction ID to link to a Books record.');
   }
+  const replacingInvalidImport = isSyntheticInvalidTransactionExternalKey(importedExternalKey);
+  const replacementExternalKey = replacingInvalidImport
+    ? text(body.replacementExternalKey, 180)
+    : '';
+  if (replacingInvalidImport && (!replacementExternalKey || isSyntheticInvalidTransactionExternalKey(replacementExternalKey))) {
+    throw new ReviewHttpError(
+      409,
+      'This eBay import is missing its real transaction ID. Run Money Sync again, or enter the corrected eBay transaction ID before posting it.',
+    );
+  }
+  const externalKey = replacingInvalidImport ? replacementExternalKey : importedExternalKey;
 
   const status = isFallbackConfirmedReviewRow(reviewRow)
     ? 'review_confirmed'
@@ -1000,13 +1031,24 @@ async function postReviewedEbayRecord({ loaded, runtime, fetchImpl, now }) {
 
   const existingTransaction = await loadReviewBookTransaction({
     ...loaded,
+    externalKey,
     fetchImpl,
     runtime,
   });
   if (existingTransaction) {
+    if (replacingInvalidImport) {
+      const removed = await deleteReviewSourceRow({ fetchImpl, loaded, runtime });
+      if (!removed) {
+        throw new ReviewHttpError(
+          409,
+          'The corrected Books record already exists, but the invalid review placeholder is no longer available to remove.',
+        );
+      }
+    }
     return {
       alreadyRecorded: true,
       bookTransactionId: text(existingTransaction.$id, 64),
+      replacedInvalidReview: replacingInvalidImport,
       status: 'posted',
     };
   }
@@ -1128,9 +1170,19 @@ async function postReviewedEbayRecord({ loaded, runtime, fetchImpl, now }) {
       transactionMemo,
     },
   });
+  if (replacingInvalidImport) {
+    const removed = await deleteReviewSourceRow({ fetchImpl, loaded, runtime });
+    if (!removed) {
+      throw new ReviewHttpError(
+        409,
+        'The corrected Books record was created, but the invalid review placeholder is no longer available to remove. Please contact support with the corrected eBay transaction ID.',
+      );
+    }
+  }
   return {
     alreadyRecorded: result.status === 'already_recorded',
     bookTransactionId: result.bookTransactionId,
+    replacedInvalidReview: replacingInvalidImport,
     status: result.status,
   };
 }
