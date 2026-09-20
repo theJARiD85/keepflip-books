@@ -930,3 +930,103 @@ test('correcting a synthetic eBay review replaces the placeholder source row', a
     restoreEnvironment(previous);
   }
 });
+
+test('Plaid Link tokens are created server-side with the Android package and no secret in the mobile payload', async () => {
+  const environmentNames = [
+    'APPWRITE_BOOKS_DATABASE_ID',
+    'APPWRITE_FUNCTION_API_ENDPOINT',
+    'APPWRITE_FUNCTION_PROJECT_ID',
+    'APPWRITE_PLAID_CONNECTIONS_TABLE_ID',
+    'APPWRITE_PLAID_TRANSACTIONS_TABLE_ID',
+    'PLAID_ANDROID_PACKAGE_NAME',
+    'PLAID_CLIENT_ID',
+    'PLAID_COUNTRY_CODES',
+    'PLAID_ENV',
+    'PLAID_SECRET',
+    'PLAID_TOKEN_ENCRYPTION_KEY',
+    'PLAID_TRANSACTIONS_DAYS_REQUESTED',
+    'PLAID_WEBHOOK_SECRET',
+    'PLAID_WEBHOOK_URL',
+  ];
+  const previous = Object.fromEntries(
+    environmentNames.map((name) => [name, process.env[name]]),
+  );
+  Object.assign(process.env, {
+    APPWRITE_BOOKS_DATABASE_ID: 'keepflip',
+    APPWRITE_FUNCTION_API_ENDPOINT: 'https://appwrite.example/v1',
+    APPWRITE_FUNCTION_PROJECT_ID: 'keepflip',
+    APPWRITE_PLAID_CONNECTIONS_TABLE_ID: 'plaid_connections',
+    APPWRITE_PLAID_TRANSACTIONS_TABLE_ID: 'plaid_transactions',
+    PLAID_ANDROID_PACKAGE_NAME: 'com.keepflip.app',
+    PLAID_CLIENT_ID: 'client-id',
+    PLAID_COUNTRY_CODES: 'US',
+    PLAID_ENV: 'sandbox',
+    PLAID_SECRET: 'server-only-secret',
+    PLAID_TOKEN_ENCRYPTION_KEY: Buffer.alloc(32).toString('base64'),
+    PLAID_TRANSACTIONS_DAYS_REQUESTED: '90',
+    PLAID_WEBHOOK_SECRET: 'webhook-secret',
+    PLAID_WEBHOOK_URL: 'https://hooks.example/keepflip/plaid',
+  });
+
+  try {
+    const plaidRequests = [];
+    const handler = createHandler({
+      authorizeBooksCapability: async () => 'user-1',
+      fetchImpl: async (url, init = {}) => {
+        const requestUrl = new URL(url);
+        if (requestUrl.pathname === '/v1/account') {
+          return jsonResponse({ $id: 'user-1' });
+        }
+        assert.equal(requestUrl.origin, 'https://sandbox.plaid.com');
+        assert.equal(requestUrl.pathname, '/link/token/create');
+        const body = JSON.parse(init.body || '{}');
+        plaidRequests.push({ body, headers: init.headers });
+        return jsonResponse({
+          expiration: '2026-09-20T12:30:00Z',
+          link_token: 'link-sandbox-token',
+        });
+      },
+    });
+    const result = { body: null, status: null };
+
+    await handler({
+      req: {
+        headers: {
+          'x-appwrite-user-jwt': 'user-jwt',
+        },
+        method: 'POST',
+        path: '/plaid/link-token',
+      },
+      res: {
+        json(body, status = 200) {
+          result.body = body;
+          result.status = status;
+          return body;
+        },
+      },
+    });
+
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.body, {
+      automationEnabled: true,
+      expiration: '2026-09-20T12:30:00Z',
+      linkToken: 'link-sandbox-token',
+      ok: true,
+    });
+    assert.equal(plaidRequests.length, 1);
+    assert.deepEqual(plaidRequests[0].body, {
+      android_package_name: 'com.keepflip.app',
+      client_name: 'KeepFlip',
+      country_codes: ['US'],
+      language: 'en',
+      products: ['transactions'],
+      transactions: { days_requested: 90 },
+      user: { client_user_id: 'user-1' },
+      webhook: 'https://hooks.example/keepflip/plaid?secret=webhook-secret',
+    });
+    assert.equal(plaidRequests[0].headers['PLAID-CLIENT-ID'], 'client-id');
+    assert.equal(plaidRequests[0].headers['PLAID-SECRET'], 'server-only-secret');
+  } finally {
+    restoreEnvironment(previous);
+  }
+});

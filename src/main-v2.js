@@ -1,4 +1,10 @@
-import { createHash } from 'node:crypto';
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  randomBytes,
+  timingSafeEqual,
+} from 'node:crypto';
 
 import {
   BOOK_ACCOUNT,
@@ -6,6 +12,11 @@ import {
   isSyntheticInvalidTransactionExternalKey,
   postBookkeepingEvent,
 } from './bookkeeping-domain.js';
+import {
+  normalizePlaidTransaction,
+  plaidTransactionMemo,
+  plaidTransactionSourceKey,
+} from './plaid-domain.js';
 import {
   ensureBookAccounts,
   getOwnedItem,
@@ -41,6 +52,8 @@ const REVIEW_POSTING_EVENT_TYPES = new Set([
 ]);
 const DEBIT_OR_CREDIT = new Set(['DEBIT', 'CREDIT']);
 const REVIEW_MAX_QUANTITY = 100_000;
+const PLAID_SYNC_MAX_PAGES = 8;
+const PLAID_SOURCE = 'plaid';
 
 // Keep the Books policy local to this deployment. Appwrite Functions run as
 // isolated packages, so a protected Books request must not rely on a nested
@@ -54,6 +67,11 @@ const BOOKS_CAPABILITY_BY_PATH = new Map([
   ['/review/confirm', 'basic_books'],
   ['/review/post', 'basic_books'],
   ['/ebay/sync', 'automated_books'],
+  ['/plaid/link-token', 'automated_books'],
+  ['/plaid/exchange', 'automated_books'],
+  ['/plaid/status', 'automated_books'],
+  ['/plaid/sync', 'automated_books'],
+  ['/plaid/disconnect', 'automated_books'],
 ]);
 
 const BOOKS_PLAN_FEATURES = {
@@ -147,6 +165,8 @@ function tableConfiguration() {
     itemsTableId: firstEnvironment(['APPWRITE_BOOK_ITEMS_TABLE_ID', 'APPWRITE_ITEMS_TABLE_ID'], 'items'),
     subscriptionsTableId: firstEnvironment(['APPWRITE_USER_SUBSCRIPTIONS_TABLE_ID'], 'user_subscriptions'),
     trialClaimsTableId: firstEnvironment(['APPWRITE_TRIAL_DEVICE_CLAIMS_TABLE_ID'], 'trial_device_claims'),
+    plaidConnectionsTableId: firstEnvironment(['APPWRITE_PLAID_CONNECTIONS_TABLE_ID']),
+    plaidTransactionsTableId: firstEnvironment(['APPWRITE_PLAID_TRANSACTIONS_TABLE_ID']),
   };
 }
 
@@ -566,6 +586,772 @@ async function deleteReviewSourceRow({ loaded, fetchImpl, runtime }) {
     if (error instanceof ReviewUpstreamError && error.status === 404) return false;
     throw error;
   }
+}
+
+function plaidStorageConfiguration() {
+  const configuration = tableConfiguration();
+  const connectionsTableId = requiredEnvironment(
+    ['APPWRITE_PLAID_CONNECTIONS_TABLE_ID'],
+    'Missing APPWRITE_PLAID_CONNECTIONS_TABLE_ID for bank connections.',
+  );
+  const transactionsTableId = requiredEnvironment(
+    ['APPWRITE_PLAID_TRANSACTIONS_TABLE_ID'],
+    'Missing APPWRITE_PLAID_TRANSACTIONS_TABLE_ID for bank transactions.',
+  );
+  const encodedKey = requiredEnvironment(
+    ['PLAID_TOKEN_ENCRYPTION_KEY'],
+    'Missing PLAID_TOKEN_ENCRYPTION_KEY for bank connections.',
+  );
+
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encodedKey)) {
+    throw new ReviewHttpError(500, 'PLAID_TOKEN_ENCRYPTION_KEY must be a Base64 32-byte key.');
+  }
+  const encryptionKey = Buffer.from(encodedKey, 'base64');
+  if (encryptionKey.length !== 32) {
+    throw new ReviewHttpError(500, 'PLAID_TOKEN_ENCRYPTION_KEY must decode to 32 bytes.');
+  }
+
+  return {
+    ...configuration,
+    encryptionKey,
+    plaidConnectionsTableId: connectionsTableId,
+    plaidTransactionsTableId: transactionsTableId,
+  };
+}
+
+function plaidApiConfiguration() {
+  const environment = firstEnvironment(['PLAID_ENV'], 'sandbox').toLowerCase();
+  const baseUrl = {
+    sandbox: 'https://sandbox.plaid.com',
+    development: 'https://development.plaid.com',
+    production: 'https://production.plaid.com',
+  }[environment];
+  if (!baseUrl) {
+    throw new ReviewHttpError(500, 'PLAID_ENV must be sandbox, development, or production.');
+  }
+
+  const countryCodes = firstEnvironment(['PLAID_COUNTRY_CODES'], 'US')
+    .split(',')
+    .map((value) => text(value, 8).toUpperCase())
+    .filter((value) => /^[A-Z]{2}$/.test(value));
+  const daysRequestedValue = Number(firstEnvironment(['PLAID_TRANSACTIONS_DAYS_REQUESTED'], '90'));
+  const daysRequested = Number.isSafeInteger(daysRequestedValue)
+    ? Math.min(Math.max(daysRequestedValue, 30), 730)
+    : 90;
+
+  return {
+    ...plaidStorageConfiguration(),
+    androidPackageName: requiredEnvironment(
+      ['PLAID_ANDROID_PACKAGE_NAME'],
+      'Missing PLAID_ANDROID_PACKAGE_NAME for Android Link sessions.',
+    ),
+    baseUrl,
+    clientId: requiredEnvironment(['PLAID_CLIENT_ID'], 'Missing PLAID_CLIENT_ID.'),
+    countryCodes: countryCodes.length ? countryCodes : ['US'],
+    daysRequested,
+    environment,
+    secret: requiredEnvironment(['PLAID_SECRET'], 'Missing PLAID_SECRET.'),
+    webhookSecret: text(process.env.PLAID_WEBHOOK_SECRET, 255),
+    webhookUrl: text(process.env.PLAID_WEBHOOK_URL, 1_000),
+  };
+}
+
+async function plaidJson({ configuration, path, body, fetchImpl }) {
+  let response;
+  try {
+    response = await fetchImpl(`${configuration.baseUrl}${path}`, {
+      body: JSON.stringify(body),
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'PLAID-CLIENT-ID': configuration.clientId,
+        'PLAID-SECRET': configuration.secret,
+      },
+      method: 'POST',
+    });
+  } catch {
+    throw new ReviewUpstreamError(0, 'KeepFlip could not reach Plaid.');
+  }
+
+  const payload = await responseJson(response);
+  if (!response.ok) {
+    throw new ReviewUpstreamError(
+      response.status,
+      'Plaid could not complete that bank request.',
+      text(payload?.error_code, 120),
+    );
+  }
+  return payload;
+}
+
+function encryptPlaidSecret(value, key) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
+  return [
+    'v1',
+    iv.toString('base64url'),
+    cipher.getAuthTag().toString('base64url'),
+    ciphertext.toString('base64url'),
+  ].join('.');
+}
+
+function decryptPlaidSecret(value, key) {
+  const [version, ivText, tagText, ciphertextText, ...extra] = String(value ?? '').split('.');
+  if (version !== 'v1' || !ivText || !tagText || !ciphertextText || extra.length > 0) {
+    throw new ReviewHttpError(500, 'KeepFlip could not read the stored bank connection.');
+  }
+  try {
+    const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(ivText, 'base64url'));
+    decipher.setAuthTag(Buffer.from(tagText, 'base64url'));
+    return Buffer.concat([
+      decipher.update(Buffer.from(ciphertextText, 'base64url')),
+      decipher.final(),
+    ]).toString('utf8');
+  } catch {
+    throw new ReviewHttpError(500, 'KeepFlip could not read the stored bank connection.');
+  }
+}
+
+function plaidConnectionRowId(ownerId, itemId) {
+  return stableId('plaid-connection', ownerId, itemId);
+}
+
+function plaidTransactionRowId(ownerId, transactionId) {
+  return stableId('plaid-transaction', ownerId, transactionId);
+}
+
+function jsonValue(value, fallback) {
+  if (typeof value !== 'string' || !value.trim()) return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function safePlaidAccounts(value) {
+  const raw = Array.isArray(value) ? value : [];
+  return raw
+    .slice(0, 50)
+    .map((account) => ({
+      id: text(account?.id, 180),
+      mask: text(account?.mask, 8) || null,
+      name: text(account?.name, 255) || null,
+      subtype: text(account?.subtype, 80) || null,
+      type: text(account?.type, 80) || null,
+    }))
+    .filter((account) => account.id);
+}
+
+function webhookUrlWithSecret(url, secret) {
+  if (!url || !secret) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}secret=${encodeURIComponent(secret)}`;
+}
+
+function requestQuery(req, name) {
+  const raw = text(req?.path || req?.url || '/', 4_000);
+  try {
+    return text(new URL(raw, 'https://keepflip.invalid').searchParams.get(name), 255);
+  } catch {
+    return '';
+  }
+}
+
+function webhookSecretMatches(expected, received) {
+  if (!expected || !received) return false;
+  const expectedBuffer = Buffer.from(expected, 'utf8');
+  const receivedBuffer = Buffer.from(received, 'utf8');
+  return expectedBuffer.length === receivedBuffer.length && timingSafeEqual(expectedBuffer, receivedBuffer);
+}
+
+async function listPlaidConnections({ apiKey, configuration, fetchImpl, ownerId, runtime }) {
+  const payload = await appwriteJson({
+    apiKey,
+    failureMessage: 'KeepFlip could not read your connected bank accounts.',
+    fetchImpl,
+    path: listRowsPath(configuration, configuration.plaidConnectionsTableId, [
+      createQuery('equal', 'ownerId', [ownerId]),
+      createQuery('limit', '', [100]),
+    ]),
+    runtime,
+  });
+  return (Array.isArray(payload?.rows) ? payload.rows : []).filter(
+    (row) => ownerIdFromRow(row) === ownerId && text(row?.status, 40) !== 'disconnected',
+  );
+}
+
+async function findPlaidConnectionByItemId({ apiKey, configuration, fetchImpl, itemId, runtime }) {
+  const payload = await appwriteJson({
+    apiKey,
+    failureMessage: 'KeepFlip could not find the bank connection.',
+    fetchImpl,
+    path: listRowsPath(configuration, configuration.plaidConnectionsTableId, [
+      createQuery('equal', 'itemId', [itemId]),
+      createQuery('limit', '', [1]),
+    ]),
+    runtime,
+  });
+  return Array.isArray(payload?.rows) ? payload.rows[0] || null : null;
+}
+
+function plaidConnectionSummary(row) {
+  return {
+    accounts: safePlaidAccounts(jsonValue(row?.accountsJson, [])),
+    connectionId: text(row?.$id, 64),
+    institutionId: text(row?.institutionId, 180) || null,
+    institutionName: text(row?.institutionName, 255) || 'Connected bank',
+    itemId: text(row?.itemId, 180),
+    lastError: text(row?.lastSyncError, 500) || null,
+    lastSyncedAt: text(row?.lastSyncedAt, 80) || null,
+    status: text(row?.status, 40) || 'connected',
+  };
+}
+
+async function savePlaidConnection({ apiKey, configuration, data, existing, fetchImpl, rowId, runtime }) {
+  if (existing) {
+    await appwriteJson({
+      apiKey,
+      body: { data },
+      failureMessage: 'KeepFlip could not update the bank connection.',
+      fetchImpl,
+      method: 'PATCH',
+      path: rowPath(configuration, configuration.plaidConnectionsTableId, rowId),
+      runtime,
+    });
+    return;
+  }
+
+  await appwriteJson({
+    apiKey,
+    body: { data, rowId },
+    failureMessage: 'KeepFlip could not save the bank connection.',
+    fetchImpl,
+    method: 'POST',
+    path: tableRowsPath(configuration, configuration.plaidConnectionsTableId),
+    runtime,
+  });
+}
+
+async function savePlaidTransaction({ apiKey, configuration, data, existing, fetchImpl, rowId, runtime }) {
+  if (existing) {
+    await appwriteJson({
+      apiKey,
+      body: { data },
+      failureMessage: 'KeepFlip could not update an imported bank transaction.',
+      fetchImpl,
+      method: 'PATCH',
+      path: rowPath(configuration, configuration.plaidTransactionsTableId, rowId),
+      runtime,
+    });
+    return;
+  }
+
+  await appwriteJson({
+    apiKey,
+    body: { data, rowId },
+    failureMessage: 'KeepFlip could not save an imported bank transaction.',
+    fetchImpl,
+    method: 'POST',
+    path: tableRowsPath(configuration, configuration.plaidTransactionsTableId),
+    runtime,
+  });
+}
+
+async function handlePlaidLinkToken({ req, res, runtime, fetchImpl }) {
+  const ownerId = await authenticatedUserId({ fetchImpl, req, runtime });
+  const configuration = plaidApiConfiguration();
+  const payload = await plaidJson({
+    body: {
+      android_package_name: configuration.androidPackageName,
+      client_name: 'KeepFlip',
+      country_codes: configuration.countryCodes,
+      language: 'en',
+      products: ['transactions'],
+      transactions: { days_requested: configuration.daysRequested },
+      user: { client_user_id: ownerId },
+      ...(configuration.webhookUrl
+        ? { webhook: webhookUrlWithSecret(configuration.webhookUrl, configuration.webhookSecret) }
+        : {}),
+    },
+    configuration,
+    fetchImpl,
+    path: '/link/token/create',
+  });
+  const linkToken = text(payload?.link_token, 4_096);
+  if (!linkToken) {
+    throw new ReviewHttpError(502, 'Plaid did not return a bank-link token.');
+  }
+
+  return res.json({
+    automationEnabled: Boolean(configuration.webhookUrl),
+    expiration: text(payload?.expiration, 80) || null,
+    linkToken,
+    ok: true,
+  });
+}
+
+async function handlePlaidExchange({ req, res, runtime, fetchImpl, now }) {
+  const ownerId = await authenticatedUserId({ fetchImpl, req, runtime });
+  const apiKey = dynamicApiKey(req);
+  const configuration = plaidApiConfiguration();
+  const body = requestBody(req);
+  const publicToken = text(body.publicToken, 4_096);
+  if (!publicToken) throw new ReviewHttpError(400, 'Plaid did not return a public token.');
+
+  const payload = await plaidJson({
+    body: { public_token: publicToken },
+    configuration,
+    fetchImpl,
+    path: '/item/public_token/exchange',
+  });
+  const accessToken = text(payload?.access_token, 8_000);
+  const itemId = text(payload?.item_id, 180);
+  if (!accessToken || !itemId) {
+    throw new ReviewHttpError(502, 'Plaid did not return a usable bank connection.');
+  }
+
+  const institution = body.institution && typeof body.institution === 'object'
+    ? body.institution
+    : {};
+  const institutionId = text(institution.id, 180) || null;
+  const institutionName = text(institution.name, 255) || 'Connected bank';
+  const accounts = safePlaidAccounts(body.accounts);
+  const rowId = plaidConnectionRowId(ownerId, itemId);
+  const existing = await getRowOrNull({
+    apiKey,
+    configuration,
+    fetchImpl,
+    rowId,
+    runtime,
+    tableId: configuration.plaidConnectionsTableId,
+  });
+  const data = {
+    accountsJson: JSON.stringify(accounts),
+    createdAt: text(existing?.createdAt, 80) || now,
+    cursor: text(existing?.cursor, 4_096) || null,
+    institutionId,
+    institutionName,
+    itemId,
+    lastSyncError: null,
+    lastSyncedAt: text(existing?.lastSyncedAt, 80) || null,
+    ownerId,
+    status: 'connected',
+    tokenCiphertext: encryptPlaidSecret(accessToken, configuration.encryptionKey),
+    updatedAt: now,
+  };
+  await savePlaidConnection({
+    apiKey,
+    configuration,
+    data,
+    existing,
+    fetchImpl,
+    rowId,
+    runtime,
+  });
+
+  return res.json({
+    accounts,
+    connection: {
+      accounts,
+      connectionId: rowId,
+      institutionId,
+      institutionName,
+      itemId,
+      lastSyncedAt: data.lastSyncedAt,
+      status: 'connected',
+    },
+    ok: true,
+  });
+}
+
+async function handlePlaidStatus({ req, res, runtime, fetchImpl }) {
+  const ownerId = await authenticatedUserId({ fetchImpl, req, runtime });
+  const apiKey = dynamicApiKey(req);
+  const configuration = plaidStorageConfiguration();
+  const rows = await listPlaidConnections({
+    apiKey,
+    configuration,
+    fetchImpl,
+    ownerId,
+    runtime,
+  });
+  return res.json({
+    automationEnabled: Boolean(text(process.env.PLAID_WEBHOOK_URL, 1_000)),
+    connections: rows.map(plaidConnectionSummary),
+    ok: true,
+  });
+}
+
+function plaidTransactionData({ connection, existing, normalized, status, bookTransactionId, now, removedAt = null }) {
+  return {
+    accountId: normalized.accountId || text(existing?.accountId, 180) || null,
+    accountMask: normalized.accountMask || text(existing?.accountMask, 8) || null,
+    accountName: normalized.accountName || text(existing?.accountName, 255) || null,
+    amountCents: normalized.amountCents,
+    authorizedAt: normalized.authorizedAt || text(existing?.authorizedAt, 80) || null,
+    categoryDetailed: normalized.categoryDetailed || text(existing?.categoryDetailed, 160) || null,
+    categoryPrimary: normalized.categoryPrimary || text(existing?.categoryPrimary, 120) || null,
+    connectionId: text(connection?.$id, 64),
+    createdAt: text(existing?.createdAt, 80) || now,
+    currency: normalized.currency,
+    merchantName: normalized.merchantName || text(existing?.merchantName, 255) || null,
+    name: normalized.name || text(existing?.name, 255) || 'Bank transaction',
+    occurredAt: normalized.occurredAt,
+    ownerId: text(connection?.ownerId, 64),
+    pending: normalized.pending,
+    plaidTransactionId: normalized.transactionId,
+    removedAt,
+    syncStatus: status,
+    transactionCode: normalized.transactionCode || text(existing?.transactionCode, 80) || null,
+    bookTransactionId: bookTransactionId || text(existing?.bookTransactionId, 64) || null,
+    updatedAt: now,
+  };
+}
+
+async function processPlaidTransaction({ apiKey, configuration, connection, fetchImpl, now, raw, runtime }) {
+  const accounts = safePlaidAccounts(jsonValue(connection?.accountsJson, []));
+  const account = accounts.find((candidate) => candidate.id === text(raw?.account_id, 180)) || null;
+  const normalized = normalizePlaidTransaction(raw, account, now);
+  if (!normalized) return { imported: 0, needsReview: 0, pending: 0, ignored: 1, updated: 0 };
+
+  const rowId = plaidTransactionRowId(connection.ownerId, normalized.transactionId);
+  const existing = await getRowOrNull({
+    apiKey,
+    configuration,
+    fetchImpl,
+    rowId,
+    runtime,
+    tableId: configuration.plaidTransactionsTableId,
+  });
+  let bookTransactionId = text(existing?.bookTransactionId, 64) || null;
+  let status = normalized.pending ? 'pending' : 'ignored';
+  let imported = 0;
+  let needsReview = 0;
+
+  if (bookTransactionId && !normalized.isExpenseCandidate) {
+    status = 'needs_review';
+    needsReview = 1;
+  } else if (normalized.isExpenseCandidate) {
+    if (bookTransactionId) {
+      const amountChanged = Number(existing?.amountCents) !== normalized.amountCents;
+      const currencyChanged = text(existing?.currency, 8).toUpperCase() !== normalized.currency;
+      status = amountChanged || currencyChanged ? 'needs_review' : 'posted';
+      needsReview = status === 'needs_review' ? 1 : 0;
+    } else {
+      await ensureBookAccounts({
+        apiKey,
+        configuration,
+        fetchImpl,
+        now,
+        ownerId: connection.ownerId,
+        runtime,
+      });
+      const memo = plaidTransactionMemo(normalized);
+      const entry = postBookkeepingEvent({
+        amountCents: normalized.amountCents,
+        currency: normalized.currency,
+        eventType: 'other_expense',
+        notes: memo,
+        occurredAt: normalized.occurredAt,
+        sourceKey: plaidTransactionSourceKey(normalized.transactionId),
+        summary: normalized.merchantName || normalized.name,
+      });
+      const result = await persistEntry({
+        apiKey,
+        configuration,
+        entry,
+        externalKey: normalized.transactionId,
+        fetchImpl,
+        now,
+        ownerId: connection.ownerId,
+        runtime,
+        source: PLAID_SOURCE,
+      });
+      bookTransactionId = result.bookTransactionId;
+      status = 'posted';
+      imported = result.status === 'already_recorded' ? 0 : 1;
+    }
+  }
+
+  await savePlaidTransaction({
+    apiKey,
+    configuration,
+    data: plaidTransactionData({
+      bookTransactionId,
+      connection,
+      existing,
+      normalized,
+      now,
+      status,
+    }),
+    existing,
+    fetchImpl,
+    rowId,
+    runtime,
+  });
+  return {
+    ignored: status === 'ignored' ? 1 : 0,
+    imported,
+    needsReview,
+    pending: status === 'pending' ? 1 : 0,
+    updated: existing ? 1 : 0,
+  };
+}
+
+async function processPlaidRemovedTransaction({ apiKey, configuration, connection, fetchImpl, now, raw, runtime }) {
+  const transactionId = text(raw?.transaction_id, 180);
+  if (!transactionId) return { needsReview: 0, removed: 0 };
+  const rowId = plaidTransactionRowId(connection.ownerId, transactionId);
+  const existing = await getRowOrNull({
+    apiKey,
+    configuration,
+    fetchImpl,
+    rowId,
+    runtime,
+    tableId: configuration.plaidTransactionsTableId,
+  });
+  if (!existing) return { needsReview: 0, removed: 0 };
+
+  const hasPostedBookTransaction = Boolean(text(existing.bookTransactionId, 64));
+  await savePlaidTransaction({
+    apiKey,
+    configuration,
+    data: {
+      removedAt: now,
+      syncStatus: hasPostedBookTransaction ? 'needs_review' : 'removed',
+      updatedAt: now,
+    },
+    existing,
+    fetchImpl,
+    rowId,
+    runtime,
+  });
+  return {
+    needsReview: hasPostedBookTransaction ? 1 : 0,
+    removed: 1,
+  };
+}
+
+async function syncPlaidConnection({ apiKey, configuration, connection, fetchImpl, now, runtime }) {
+  const encryptedToken = text(connection?.tokenCiphertext, 12_000);
+  const accessToken = decryptPlaidSecret(encryptedToken, configuration.encryptionKey);
+  let cursor = text(connection?.cursor, 4_096) || null;
+  let hasMore = true;
+  let pages = 0;
+  const totals = {
+    ignored: 0,
+    imported: 0,
+    needsReview: 0,
+    pending: 0,
+    removed: 0,
+    updated: 0,
+  };
+
+  while (hasMore && pages < PLAID_SYNC_MAX_PAGES) {
+    const payload = await plaidJson({
+      body: {
+        access_token: accessToken,
+        ...(cursor ? { cursor } : {}),
+      },
+      configuration,
+      fetchImpl,
+      path: '/transactions/sync',
+    });
+    const added = Array.isArray(payload?.added) ? payload.added : [];
+    const modified = Array.isArray(payload?.modified) ? payload.modified : [];
+    const removed = Array.isArray(payload?.removed) ? payload.removed : [];
+    for (const raw of [...added, ...modified]) {
+      const result = await processPlaidTransaction({
+        apiKey,
+        configuration,
+        connection,
+        fetchImpl,
+        now,
+        raw,
+        runtime,
+      });
+      for (const key of Object.keys(totals)) totals[key] += result[key] || 0;
+    }
+    for (const raw of removed) {
+      const result = await processPlaidRemovedTransaction({
+        apiKey,
+        configuration,
+        connection,
+        fetchImpl,
+        now,
+        raw,
+        runtime,
+      });
+      totals.needsReview += result.needsReview;
+      totals.removed += result.removed;
+    }
+    const nextCursor = text(payload?.next_cursor, 4_096);
+    hasMore = payload?.has_more === true;
+    if (hasMore && !nextCursor) {
+      throw new ReviewHttpError(502, 'Plaid returned an incomplete transaction cursor.');
+    }
+    cursor = nextCursor || cursor;
+    pages += 1;
+  }
+
+  await appwriteJson({
+    apiKey,
+    body: {
+      data: {
+        cursor,
+        lastSyncError: null,
+        lastSyncedAt: now,
+        updatedAt: now,
+      },
+    },
+    failureMessage: 'KeepFlip could not save the bank sync cursor.',
+    fetchImpl,
+    method: 'PATCH',
+    path: rowPath(configuration, configuration.plaidConnectionsTableId, connection.$id),
+    runtime,
+  });
+  return { ...totals, hasMore, pages };
+}
+
+async function handlePlaidSync({ req, res, runtime, fetchImpl, now }) {
+  const ownerId = await authenticatedUserId({ fetchImpl, req, runtime });
+  const apiKey = dynamicApiKey(req);
+  const configuration = plaidApiConfiguration();
+  const requestedConnectionId = text(requestBody(req).connectionId, 64);
+  const rows = await listPlaidConnections({
+    apiKey,
+    configuration,
+    fetchImpl,
+    ownerId,
+    runtime,
+  });
+  const connections = requestedConnectionId
+    ? rows.filter((row) => text(row?.$id, 64) === requestedConnectionId)
+    : rows;
+  if (requestedConnectionId && !connections.length) {
+    throw new ReviewHttpError(404, 'That bank connection is no longer available.');
+  }
+
+  const totals = {
+    connections: 0,
+    failedConnections: 0,
+    hasMore: false,
+    ignored: 0,
+    imported: 0,
+    needsReview: 0,
+    pending: 0,
+    removed: 0,
+    updated: 0,
+  };
+  const errors = [];
+  for (const connection of connections) {
+    try {
+      const result = await syncPlaidConnection({
+        apiKey,
+        configuration,
+        connection,
+        fetchImpl,
+        now,
+        runtime,
+      });
+      totals.connections += 1;
+      totals.hasMore ||= result.hasMore;
+      for (const key of ['ignored', 'imported', 'needsReview', 'pending', 'removed', 'updated']) {
+        totals[key] += result[key] || 0;
+      }
+    } catch (error) {
+      totals.failedConnections += 1;
+      errors.push(text(error instanceof Error ? error.message : 'Bank sync failed.', 255));
+      await appwriteJson({
+        apiKey,
+        body: { data: { lastSyncError: errors[errors.length - 1], updatedAt: now } },
+        failureMessage: 'KeepFlip could not record the bank sync error.',
+        fetchImpl,
+        method: 'PATCH',
+        path: rowPath(configuration, configuration.plaidConnectionsTableId, connection.$id),
+        runtime,
+      }).catch(() => undefined);
+    }
+  }
+  return res.json({ ...totals, errors, ok: true });
+}
+
+async function handlePlaidDisconnect({ req, res, runtime, fetchImpl, now }) {
+  const ownerId = await authenticatedUserId({ fetchImpl, req, runtime });
+  const apiKey = dynamicApiKey(req);
+  const configuration = plaidApiConfiguration();
+  const body = requestBody(req);
+  const requestedConnectionId = text(body.connectionId, 64);
+  const rows = await listPlaidConnections({
+    apiKey,
+    configuration,
+    fetchImpl,
+    ownerId,
+    runtime,
+  });
+  const connection = rows.find((row) =>
+    requestedConnectionId
+      ? text(row?.$id, 64) === requestedConnectionId
+      : text(row?.itemId, 180) === text(body.itemId, 180),
+  );
+  if (!connection) throw new ReviewHttpError(404, 'That bank connection is no longer available.');
+
+  const accessToken = decryptPlaidSecret(text(connection.tokenCiphertext, 12_000), configuration.encryptionKey);
+  await plaidJson({
+    body: { access_token: accessToken },
+    configuration,
+    fetchImpl,
+    path: '/item/remove',
+  });
+  await appwriteJson({
+    apiKey,
+    body: {
+      data: {
+        disconnectedAt: now,
+        lastSyncError: null,
+        status: 'disconnected',
+        tokenCiphertext: '',
+        updatedAt: now,
+      },
+    },
+    failureMessage: 'KeepFlip could not save the disconnected bank state.',
+    fetchImpl,
+    method: 'PATCH',
+    path: rowPath(configuration, configuration.plaidConnectionsTableId, connection.$id),
+    runtime,
+  });
+  return res.json({ connectionId: connection.$id, ok: true });
+}
+
+async function handlePlaidWebhook({ req, res, runtime, fetchImpl, now }) {
+  const configuration = plaidApiConfiguration();
+  if (!webhookSecretMatches(configuration.webhookSecret, requestQuery(req, 'secret'))) {
+    throw new ReviewHttpError(401, 'Plaid webhook verification failed.');
+  }
+
+  const itemId = text(requestBody(req).item_id, 180);
+  if (!itemId) return res.json({ ignored: true, ok: true });
+  const apiKey = dynamicApiKey(req);
+  const connection = await findPlaidConnectionByItemId({
+    apiKey,
+    configuration,
+    fetchImpl,
+    itemId,
+    runtime,
+  });
+  if (!connection || text(connection.status, 40) === 'disconnected') {
+    return res.json({ ignored: true, ok: true });
+  }
+  const result = await syncPlaidConnection({
+    apiKey,
+    configuration,
+    connection,
+    fetchImpl,
+    now,
+    runtime,
+  });
+  return res.json({ ...result, ok: true });
 }
 
 async function handleReviewList({ req, res, runtime, fetchImpl }) {
@@ -1328,6 +2114,28 @@ export function createHandler(options = {}) {
           req: context.req,
           runtime,
         });
+      }
+      if (method === 'POST' && path === '/plaid/webhook') {
+        const now = new Date(nowProvider()).toISOString();
+        return await handlePlaidWebhook({ ...context, fetchImpl, now, runtime });
+      }
+      if (method === 'POST' && path === '/plaid/link-token') {
+        return await handlePlaidLinkToken({ ...context, fetchImpl, runtime });
+      }
+      if (method === 'POST' && path === '/plaid/exchange') {
+        const now = new Date(nowProvider()).toISOString();
+        return await handlePlaidExchange({ ...context, fetchImpl, now, runtime });
+      }
+      if (method === 'POST' && path === '/plaid/status') {
+        return await handlePlaidStatus({ ...context, fetchImpl, runtime });
+      }
+      if (method === 'POST' && path === '/plaid/sync') {
+        const now = new Date(nowProvider()).toISOString();
+        return await handlePlaidSync({ ...context, fetchImpl, now, runtime });
+      }
+      if (method === 'POST' && path === '/plaid/disconnect') {
+        const now = new Date(nowProvider()).toISOString();
+        return await handlePlaidDisconnect({ ...context, fetchImpl, now, runtime });
       }
       if (method === 'POST' && path === '/review/detail') {
         return await handleReviewDetail({ ...context, fetchImpl, runtime });
