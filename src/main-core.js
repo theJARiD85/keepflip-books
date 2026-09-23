@@ -1493,6 +1493,7 @@ function reviewSourceLabel(value) {
     shipping_label: 'shipping label',
     shipping_label_credit: 'shipping label credit',
     shipping_label_booking_unknown: 'shipping label',
+    sourcing_trip_mileage: 'sourcing trip mileage',
     transfer: 'transfer',
     unclassified: 'unclassified eBay record',
     unknown: 'legacy eBay review record',
@@ -1510,6 +1511,17 @@ function reviewReasonForRow(row) {
     sourceType === 'unknown' &&
     amountCents === 0 &&
     currency === 'USD';
+
+  if (baseSourceType === 'sourcing_trip_mileage') {
+    const mileageMeters = Number(row?.mileageMeters);
+    const miles = Number.isSafeInteger(mileageMeters) && mileageMeters > 0
+      ? (mileageMeters / 1_609.344).toFixed(1)
+      : 'recorded';
+    if (status === 'posted') {
+      return `Sourcing-trip mileage of ${miles} miles was reviewed and posted to Books.`;
+    }
+    return `This sourcing trip recorded ${miles} miles. Choose the applicable mileage rate before posting it to Books.`;
+  }
 
   if (legacyFallback) {
     return 'This review row was saved by the older sync that replaced unreadable eBay details with Unknown / $0.00. Run eBay money sync again so KeepFlip can refresh the real transaction type, amount, and currency.';
@@ -1573,6 +1585,7 @@ export function reviewItemForRow(row) {
   const storedAmountCents = Number(row?.amountCents);
   const storedCurrency = text(row?.currency, 8).toUpperCase();
   const sourceType = text(row?.sourceType, 60).toLowerCase() || 'unclassified';
+  const isSourcingTripMileage = sourceType === 'sourcing_trip_mileage';
   const legacyFallback =
     sourceType === 'unknown' &&
     storedAmountCents === 0 &&
@@ -1580,9 +1593,12 @@ export function reviewItemForRow(row) {
   const amountKnown =
     !legacyFallback &&
     Number.isSafeInteger(storedAmountCents) &&
-    storedAmountCents >= 0 &&
+    (isSourcingTripMileage ? storedAmountCents > 0 : storedAmountCents >= 0) &&
     /^[A-Z]{3}$/.test(storedCurrency) &&
     storedCurrency !== 'XXX';
+
+  const mileageMeters = Number(row?.mileageMeters);
+  const mileageRateCents = Number(row?.mileageRateCents);
 
   return {
     amountCents: amountKnown ? storedAmountCents : null,
@@ -1592,6 +1608,14 @@ export function reviewItemForRow(row) {
     id: text(row?.$id, 64),
     itemId: text(row?.itemId, 64) || null,
     legacyFallback,
+    mileageMeters:
+      Number.isSafeInteger(mileageMeters) && mileageMeters >= 0
+        ? mileageMeters
+        : null,
+    mileageRateCents:
+      Number.isSafeInteger(mileageRateCents) && mileageRateCents > 0
+        ? mileageRateCents
+        : null,
     occurredAt: text(row?.occurredAt, 64),
     orderId: text(row?.orderId, 180) || null,
     payoutId: text(row?.payoutId, 180) || null,

@@ -66,6 +66,7 @@ const BOOKS_CAPABILITY_BY_PATH = new Map([
   ['/review/resolve', 'basic_books'],
   ['/review/confirm', 'basic_books'],
   ['/review/post', 'basic_books'],
+  ['/review/sourcing-trip', 'basic_books'],
   ['/ebay/sync', 'automated_books'],
   ['/plaid/link-token', 'automated_books'],
   ['/plaid/exchange', 'automated_books'],
@@ -159,6 +160,7 @@ function tableConfiguration() {
     databaseId: firstEnvironment(['APPWRITE_BOOKS_DATABASE_ID', 'APPWRITE_DATABASE_ID'], 'keepflip'),
     accountsTableId: firstEnvironment(['APPWRITE_BOOK_ACCOUNTS_TABLE_ID'], 'book_accounts'),
     sourceEventsTableId: firstEnvironment(['APPWRITE_BOOK_SOURCE_EVENTS_TABLE_ID'], 'book_source_events'),
+    sourcingTripsTableId: firstEnvironment(['APPWRITE_SOURCING_TRIPS_TABLE_ID'], 'sourcing_trips'),
     transactionsTableId: firstEnvironment(['APPWRITE_BOOK_TRANSACTIONS_TABLE_ID'], 'book_transactions'),
     journalLinesTableId: firstEnvironment(['APPWRITE_BOOK_JOURNAL_LINES_TABLE_ID'], 'book_journal_lines'),
     payoutsTableId: firstEnvironment(['APPWRITE_BOOK_PAYOUTS_TABLE_ID'], 'book_payouts'),
@@ -373,6 +375,10 @@ function transactionRowId(ownerId, source, externalKey) {
   return stableId('book-transaction', ownerId, source, externalKey);
 }
 
+function sourceEventRowId(ownerId, source, externalKey) {
+  return stableId('book-source-event', ownerId, source, externalKey);
+}
+
 function reviewCostLineId(bookTransactionId, reviewId, side) {
   return stableId('book-cost-review-line', bookTransactionId, reviewId, side);
 }
@@ -495,6 +501,8 @@ function reviewDetailForRow(row, item = null, bookTransaction = null) {
     reason: storedReason || base.reason,
     reviewUpdatedAt: text(row?.reviewUpdatedAt, 80) || null,
     transactionMemo: text(row?.transactionMemo, 1_000) || null,
+    mileageMeters: base.mileageMeters,
+    mileageRateCents: base.mileageRateCents,
     bookTransactionId: bookTransaction ? text(bookTransaction?.$id, 64) || null : null,
     item: item
       ? {
@@ -557,11 +565,12 @@ async function loadReviewBookTransaction({
 }) {
   const externalKey = text(externalKeyOverride, 255) || text(reviewRow?.externalKey, 255);
   if (!externalKey) return null;
+  const source = text(reviewRow?.source, 80) || 'ebay_finances';
   const bookTransaction = await getRowOrNull({
     apiKey,
     configuration,
     fetchImpl,
-    rowId: transactionRowId(ownerId, 'ebay_finances', externalKey),
+    rowId: transactionRowId(ownerId, source, externalKey),
     runtime,
     tableId: configuration.transactionsTableId,
   });
@@ -1383,6 +1392,160 @@ async function handlePlaidWebhook({ req, res, runtime, fetchImpl, now }) {
   return res.json({ ...result, ok: true });
 }
 
+function positiveMileageRateCents(value) {
+  const rateCents = positiveCents(value, 'Mileage rate');
+  if (rateCents > 100_000) {
+    throw new ReviewHttpError(400, 'Mileage rate must be no more than $1,000.00 per mile.');
+  }
+  return rateCents;
+}
+
+function mileageExpenseCents(mileageMeters, mileageRateCents) {
+  // 1 mile is 1,609.344 meters. Keep the calculation in integer arithmetic
+  // until the final cent is rounded so a client-provided amount cannot change
+  // the recorded trip distance or introduce floating-point money values.
+  const amountCents = Math.round((mileageMeters * mileageRateCents * 1_000) / 1_609_344);
+  if (!Number.isSafeInteger(amountCents) || amountCents <= 0) {
+    throw new ReviewHttpError(
+      400,
+      'The recorded mileage and rate must produce a positive Books amount.',
+    );
+  }
+  return amountCents;
+}
+
+function sourcingTripMiles(mileageMeters) {
+  return (mileageMeters / 1_609.344).toFixed(1);
+}
+
+function sourcingTripReviewReason(mileageMeters) {
+  return `This sourcing trip recorded ${sourcingTripMiles(mileageMeters)} miles. Choose the applicable mileage rate before posting it to Books.`;
+}
+
+async function handleSourcingTripReview({ req, res, runtime, fetchImpl, now }) {
+  const ownerId = await authenticatedUserId({ fetchImpl, req, runtime });
+  const apiKey = dynamicApiKey(req);
+  const configuration = tableConfiguration();
+  const body = requestBody(req);
+  const sourceTripId = text(body.sourceTripId, 64);
+  if (!sourceTripId) {
+    throw new ReviewHttpError(400, 'Choose the sourcing trip whose mileage needs review.');
+  }
+
+  const trip = await getRowOrNull({
+    apiKey,
+    configuration,
+    fetchImpl,
+    rowId: sourceTripId,
+    runtime,
+    tableId: configuration.sourcingTripsTableId,
+  });
+  if (!trip || ownerIdFromRow(trip) !== ownerId) {
+    throw new ReviewHttpError(404, 'That sourcing trip is no longer available.');
+  }
+  if (text(trip.status, 32) !== 'closed') {
+    throw new ReviewHttpError(409, 'Close the sourcing trip before reviewing its mileage.');
+  }
+
+  const mileageMeters = Number(trip.mileageMeters);
+  if (!Number.isSafeInteger(mileageMeters) || mileageMeters <= 0) {
+    throw new ReviewHttpError(409, 'This sourcing trip does not contain usable recorded mileage.');
+  }
+
+  const source = 'sourcing_trip';
+  const sourceType = 'sourcing_trip_mileage';
+  const reviewId = sourceEventRowId(ownerId, source, sourceTripId);
+  const existing = await getRowOrNull({
+    apiKey,
+    configuration,
+    fetchImpl,
+    rowId: reviewId,
+    runtime,
+    tableId: configuration.sourceEventsTableId,
+  });
+  if (existing) {
+    return res.json({
+      alreadyQueued: true,
+      mileageMeters,
+      ok: true,
+      reviewId,
+      sourceTripId,
+      status: text(existing.eventStatus, 40) || 'needs_review',
+    });
+  }
+
+  const occurredAt = text(trip.closedAt, 80) || text(trip.startedAt, 80) || now;
+  const sourceName = text(trip.label, 160) || text(trip.sourceName, 120) || 'Sourcing trip';
+  const transactionMemo = `Sourcing trip: ${sourceName} · ${sourcingTripMiles(mileageMeters)} miles tracked. Choose a rate before posting.`;
+  const data = {
+    amountCents: 0,
+    createdAt: now,
+    currency: 'USD',
+    eventStatus: 'needs_review',
+    externalKey: sourceTripId,
+    itemId: null,
+    occurredAt,
+    orderId: null,
+    ownerId,
+    payloadDigest: createHash('sha256')
+      .update(JSON.stringify({ mileageMeters, occurredAt, ownerId, source, sourceTripId }), 'utf8')
+      .digest('hex'),
+    payoutId: null,
+    rawTransactionType: 'SOURCING_TRIP_MILEAGE',
+    reviewReason: sourcingTripReviewReason(mileageMeters),
+    source,
+    sourceType,
+    transactionMemo,
+    mileageMeters,
+  };
+
+  try {
+    await appwriteJson({
+      apiKey,
+      body: { data, rowId: reviewId },
+      failureMessage: 'KeepFlip could not queue the sourcing-trip mileage review.',
+      fetchImpl,
+      method: 'POST',
+      path: tableRowsPath(configuration, configuration.sourceEventsTableId),
+      runtime,
+    });
+  } catch (error) {
+    // A retry can race with the original close request. The deterministic row
+    // ID makes that safe; return the row that won the race if Appwrite rejects
+    // the duplicate create.
+    if (error instanceof ReviewUpstreamError && error.status === 409) {
+      const raced = await getRowOrNull({
+        apiKey,
+        configuration,
+        fetchImpl,
+        rowId: reviewId,
+        runtime,
+        tableId: configuration.sourceEventsTableId,
+      });
+      if (raced) {
+        return res.json({
+          alreadyQueued: true,
+          mileageMeters,
+          ok: true,
+          reviewId,
+          sourceTripId,
+          status: text(raced.eventStatus, 40) || 'needs_review',
+        });
+      }
+    }
+    throw error;
+  }
+
+  return res.json({
+    alreadyQueued: false,
+    mileageMeters,
+    ok: true,
+    reviewId,
+    sourceTripId,
+    status: 'needs_review',
+  });
+}
+
 async function handleReviewList({ req, res, runtime, fetchImpl }) {
   const ownerId = await authenticatedUserId({ fetchImpl, req, runtime });
   const apiKey = dynamicApiKey(req);
@@ -1804,6 +1967,105 @@ async function confirmGeneralReview({ loaded, runtime, fetchImpl, now }) {
   };
 }
 
+async function postReviewedSourcingTripMileage({ loaded, runtime, fetchImpl, now }) {
+  const { apiKey, body, configuration, ownerId, reviewId, reviewRow } = loaded;
+  const source = text(reviewRow?.source, 80);
+  const sourceType = text(reviewRow?.sourceType, 80).toLowerCase();
+  if (source !== 'sourcing_trip' || sourceType !== 'sourcing_trip_mileage') {
+    throw new ReviewHttpError(409, 'This is not a sourcing-trip mileage review.');
+  }
+
+  const status = text(reviewRow?.eventStatus, 40);
+  if (!OPEN_REVIEW_STATUSES.has(status) && status !== 'review_confirmed') {
+    throw new ReviewHttpError(409, 'That sourcing-trip mileage review can no longer be posted.');
+  }
+
+  const sourceTripId = text(reviewRow?.externalKey, 255);
+  if (!sourceTripId) {
+    throw new ReviewHttpError(409, 'This sourcing-trip mileage review has no trip ID to link to Books.');
+  }
+
+  const existingTransaction = await loadReviewBookTransaction({
+    ...loaded,
+    fetchImpl,
+    runtime,
+  });
+  if (existingTransaction) {
+    return {
+      alreadyRecorded: true,
+      bookTransactionId: text(existingTransaction.$id, 64),
+      replacedInvalidReview: false,
+      status: 'posted',
+    };
+  }
+
+  const mileageMeters = Number(reviewRow?.mileageMeters);
+  if (!Number.isSafeInteger(mileageMeters) || mileageMeters <= 0) {
+    throw new ReviewHttpError(409, 'The saved sourcing trip does not contain usable mileage.');
+  }
+  if (text(body.eventType, 60).toLowerCase() !== 'mileage') {
+    throw new ReviewHttpError(400, 'Record this sourcing-trip review as mileage.');
+  }
+
+  const mileageRateCents = positiveMileageRateCents(body.mileageRateCents);
+  const amountCents = mileageExpenseCents(mileageMeters, mileageRateCents);
+  const currency = normalizedCurrency(body.currency, 'USD');
+  if (currency !== 'USD') {
+    throw new ReviewHttpError(400, 'Sourcing-trip mileage must be posted in USD.');
+  }
+  const occurredAt = reviewedDate(body.occurredAt || reviewRow?.occurredAt);
+  const defaultMemo = `Sourcing trip mileage · ${sourcingTripMiles(mileageMeters)} miles at $${(mileageRateCents / 100).toFixed(2)} per mile`;
+  const transactionMemo = text(body.transactionMemo, 1_000) || defaultMemo;
+
+  let entry;
+  try {
+    entry = postBookkeepingEvent({
+      amountCents,
+      currency,
+      eventType: 'mileage',
+      notes: transactionMemo,
+      occurredAt,
+      sourceKey: `sourcing_trip:reviewed:${sourceTripId}`,
+      summary: 'Sourcing trip mileage',
+    });
+  } catch (error) {
+    if (error instanceof BookkeepingValidationError) {
+      throw new ReviewHttpError(400, error.message);
+    }
+    throw error;
+  }
+
+  await ensureBookAccounts({ apiKey, configuration, fetchImpl, now, ownerId, runtime });
+  const result = await persistEntry({
+    apiKey,
+    configuration,
+    entry,
+    externalKey: sourceTripId,
+    fetchImpl,
+    now,
+    ownerId,
+    runtime,
+    source,
+    sourceEventPatch: {
+      bookingEntry: 'DEBIT',
+      mileageMeters,
+      mileageRateCents,
+      rawTransactionType: 'SOURCING_TRIP_MILEAGE',
+      reviewReason: `User reviewed and posted ${sourcingTripMiles(mileageMeters)} sourcing-trip miles at $${(mileageRateCents / 100).toFixed(2)} per mile.`,
+      reviewUpdatedAt: now,
+      sourceType,
+      transactionMemo,
+    },
+  });
+
+  return {
+    alreadyRecorded: result.status === 'already_recorded',
+    bookTransactionId: result.bookTransactionId,
+    replacedInvalidReview: false,
+    status: 'posted',
+  };
+}
+
 function reviewPostingSummary(eventType) {
   return `Reviewed eBay ${eventType.replace(/_/g, ' ')}`;
 }
@@ -2004,7 +2266,9 @@ async function postReviewedEbayRecord({ loaded, runtime, fetchImpl, now }) {
 
 async function handleReviewPost({ req, res, runtime, fetchImpl, now }) {
   const loaded = await loadOwnedReview({ fetchImpl, req, runtime });
-  const result = await postReviewedEbayRecord({ fetchImpl, loaded, now, runtime });
+  const result = text(loaded.reviewRow?.source, 80) === 'sourcing_trip'
+    ? await postReviewedSourcingTripMileage({ fetchImpl, loaded, now, runtime })
+    : await postReviewedEbayRecord({ fetchImpl, loaded, now, runtime });
   return res.json({ ...result, ok: true });
 }
 
@@ -2171,6 +2435,10 @@ export function createHandler(options = {}) {
       }
       if (method === 'POST' && path === '/review/list') {
         return await handleReviewList({ ...context, fetchImpl, runtime });
+      }
+      if (method === 'POST' && path === '/review/sourcing-trip') {
+        const now = new Date(nowProvider()).toISOString();
+        return await handleSourcingTripReview({ ...context, fetchImpl, now, runtime });
       }
       if (method === 'POST' && path === '/review/confirm') {
         const now = new Date(nowProvider()).toISOString();

@@ -800,6 +800,256 @@ test('review post creates one Books record tied to the imported eBay transaction
   }
 });
 
+test('closed sourcing-trip mileage is queued once and remains reviewable until a rate is supplied', async () => {
+  const environmentNames = [
+    'APPWRITE_BOOKS_DATABASE_ID',
+    'APPWRITE_BOOK_SOURCE_EVENTS_TABLE_ID',
+    'APPWRITE_FUNCTION_API_ENDPOINT',
+    'APPWRITE_FUNCTION_PROJECT_ID',
+    'APPWRITE_SOURCING_TRIPS_TABLE_ID',
+  ];
+  const previous = Object.fromEntries(
+    environmentNames.map((name) => [name, process.env[name]]),
+  );
+  Object.assign(process.env, {
+    APPWRITE_BOOKS_DATABASE_ID: 'keepflip',
+    APPWRITE_BOOK_SOURCE_EVENTS_TABLE_ID: 'book_source_events',
+    APPWRITE_FUNCTION_API_ENDPOINT: 'https://appwrite.example/v1',
+    APPWRITE_FUNCTION_PROJECT_ID: 'keepflip',
+    APPWRITE_SOURCING_TRIPS_TABLE_ID: 'sourcing_trips',
+  });
+
+  try {
+    let queuedRow = null;
+    let createCount = 0;
+    const handler = createHandler({
+      authorizeBooksCapability: async () => 'user-1',
+      now: () => '2026-09-23T22:00:00.000Z',
+      fetchImpl: async (url, init = {}) => {
+        const requestUrl = new URL(url);
+        const method = init.method || 'GET';
+        if (requestUrl.pathname === '/v1/account') {
+          return jsonResponse({ $id: 'user-1' });
+        }
+        if (requestUrl.pathname.endsWith('/sourcing_trips/rows/trip-1')) {
+          return jsonResponse({
+            $id: 'trip-1',
+            closedAt: '2026-09-23T20:00:00.000Z',
+            label: 'Saturday route',
+            mileageMeters: 16_093,
+            ownerId: 'user-1',
+            sourceName: 'Goodwill on Main',
+            startedAt: '2026-09-23T17:00:00.000Z',
+            status: 'closed',
+          });
+        }
+        if (requestUrl.pathname.includes('/book_source_events/rows')) {
+          if (method === 'GET' && queuedRow) return jsonResponse(queuedRow);
+          if (method === 'GET') return jsonResponse({ message: 'Not found.' }, 404);
+          if (method === 'POST') {
+            createCount += 1;
+            queuedRow = {
+              $id: JSON.parse(init.body || '{}').rowId,
+              ...JSON.parse(init.body || '{}').data,
+            };
+            return jsonResponse(queuedRow, 201);
+          }
+        }
+        throw new Error(`Unexpected sourcing-mileage queue request: ${method} ${requestUrl.pathname}`);
+      },
+    });
+
+    const invoke = async () => {
+      const result = { body: null, status: null };
+      await handler({
+        req: {
+          bodyJson: { sourceTripId: 'trip-1' },
+          headers: {
+            'x-appwrite-key': 'function-key',
+            'x-appwrite-user-jwt': 'user-jwt',
+          },
+          method: 'POST',
+          path: '/review/sourcing-trip',
+        },
+        res: {
+          json(body, status = 200) {
+            result.body = body;
+            result.status = status;
+            return body;
+          },
+        },
+      });
+      return result;
+    };
+
+    const first = await invoke();
+    const second = await invoke();
+
+    assert.equal(first.status, 200);
+    assert.equal(first.body?.ok, true);
+    assert.equal(first.body?.status, 'needs_review');
+    assert.equal(first.body?.mileageMeters, 16_093);
+    assert.equal(second.body?.alreadyQueued, true);
+    assert.equal(second.body?.reviewId, first.body?.reviewId);
+    assert.equal(createCount, 1);
+    assert.equal(queuedRow?.source, 'sourcing_trip');
+    assert.equal(queuedRow?.sourceType, 'sourcing_trip_mileage');
+    assert.equal(queuedRow?.eventStatus, 'needs_review');
+    assert.equal(queuedRow?.amountCents, 0);
+    assert.equal(queuedRow?.mileageMeters, 16_093);
+  } finally {
+    restoreEnvironment(previous);
+  }
+});
+
+test('sourcing-trip mileage review computes the expense from the saved distance and user rate', async () => {
+  const environmentNames = [
+    'APPWRITE_BOOK_ACCOUNTS_TABLE_ID',
+    'APPWRITE_BOOK_DATABASE_ID',
+    'APPWRITE_BOOK_JOURNAL_LINES_TABLE_ID',
+    'APPWRITE_BOOK_SOURCE_EVENTS_TABLE_ID',
+    'APPWRITE_BOOK_TRANSACTIONS_TABLE_ID',
+    'APPWRITE_FUNCTION_API_ENDPOINT',
+    'APPWRITE_FUNCTION_PROJECT_ID',
+  ];
+  const previous = Object.fromEntries(
+    environmentNames.map((name) => [name, process.env[name]]),
+  );
+  Object.assign(process.env, {
+    APPWRITE_BOOKS_DATABASE_ID: 'keepflip',
+    APPWRITE_BOOK_ACCOUNTS_TABLE_ID: 'book_accounts',
+    APPWRITE_BOOK_JOURNAL_LINES_TABLE_ID: 'book_journal_lines',
+    APPWRITE_BOOK_SOURCE_EVENTS_TABLE_ID: 'book_source_events',
+    APPWRITE_BOOK_TRANSACTIONS_TABLE_ID: 'book_transactions',
+    APPWRITE_FUNCTION_API_ENDPOINT: 'https://appwrite.example/v1',
+    APPWRITE_FUNCTION_PROJECT_ID: 'keepflip',
+  });
+
+  try {
+    let stagedOperations = [];
+    const reviewRow = {
+      $id: 'review-mileage-1',
+      amountCents: 0,
+      currency: 'USD',
+      eventStatus: 'needs_review',
+      externalKey: 'trip-1',
+      mileageMeters: 16_093,
+      occurredAt: '2026-09-23T20:00:00.000Z',
+      ownerId: 'user-1',
+      source: 'sourcing_trip',
+      sourceType: 'sourcing_trip_mileage',
+    };
+    const handler = createHandler({
+      authorizeBooksCapability: async () => 'user-1',
+      now: () => '2026-09-23T22:05:00.000Z',
+      fetchImpl: async (url, init = {}) => {
+        const requestUrl = new URL(url);
+        const method = init.method || 'GET';
+        if (requestUrl.pathname === '/v1/account') {
+          return jsonResponse({ $id: 'user-1' });
+        }
+        if (requestUrl.pathname.includes('/book_source_events/rows/')) {
+          return jsonResponse(reviewRow);
+        }
+        if (requestUrl.pathname.includes('/book_transactions/rows/')) {
+          return jsonResponse({ message: 'Not found.' }, 404);
+        }
+        if (requestUrl.pathname.includes('/book_accounts/rows/')) {
+          return jsonResponse({ message: 'Not found.' }, 404);
+        }
+        if (
+          requestUrl.pathname === '/v1/tablesdb/keepflip/tables/book_accounts/rows' &&
+          method === 'POST'
+        ) {
+          return jsonResponse({ $id: 'account' }, 201);
+        }
+        if (requestUrl.pathname === '/v1/tablesdb/transactions' && method === 'POST') {
+          return jsonResponse({ $id: 'transaction-mileage-1' }, 201);
+        }
+        if (
+          requestUrl.pathname === '/v1/tablesdb/transactions/transaction-mileage-1/operations' &&
+          method === 'POST'
+        ) {
+          stagedOperations = JSON.parse(init.body || '{}').operations || [];
+          return jsonResponse({});
+        }
+        if (
+          requestUrl.pathname === '/v1/tablesdb/transactions/transaction-mileage-1' &&
+          method === 'PATCH'
+        ) {
+          return jsonResponse({});
+        }
+        throw new Error(`Unexpected sourcing-mileage post request: ${method} ${requestUrl.pathname}`);
+      },
+    });
+
+    const result = { body: null, status: null };
+    await handler({
+      req: {
+        bodyJson: {
+          amountCents: 9_999_999,
+          bookingEntry: 'CREDIT',
+          currency: 'USD',
+          eventType: 'mileage',
+          mileageRateCents: 76,
+          occurredAt: '2026-09-23T20:00:00.000Z',
+          reviewId: 'review-mileage-1',
+          transactionType: 'SOURCING_TRIP_MILEAGE',
+        },
+        headers: {
+          'x-appwrite-key': 'function-key',
+          'x-appwrite-user-jwt': 'user-jwt',
+        },
+        method: 'POST',
+        path: '/review/post',
+      },
+      res: {
+        json(body, status = 200) {
+          result.body = body;
+          result.status = status;
+          return body;
+        },
+      },
+    });
+
+    assert.equal(result.status, 200);
+    assert.equal(result.body?.ok, true);
+    assert.equal(result.body?.status, 'posted');
+    const transactionOperation = stagedOperations.find(
+      (operation) => operation.tableId === 'book_transactions',
+    );
+    const sourceOperation = stagedOperations.find(
+      (operation) => operation.tableId === 'book_source_events',
+    );
+    const journalOperations = stagedOperations.filter(
+      (operation) => operation.tableId === 'book_journal_lines',
+    );
+
+    assert.equal(transactionOperation?.data?.source, 'sourcing_trip');
+    assert.equal(transactionOperation?.data?.externalKey, 'trip-1');
+    assert.equal(transactionOperation?.data?.eventType, 'mileage');
+    assert.equal(transactionOperation?.data?.currency, 'USD');
+    assert.equal(sourceOperation?.data?.eventStatus, 'posted');
+    assert.equal(sourceOperation?.data?.mileageMeters, 16_093);
+    assert.equal(sourceOperation?.data?.mileageRateCents, 76);
+    assert.equal(sourceOperation?.data?.amountCents, 760);
+    assert.equal(journalOperations.length, 2);
+    assert.deepEqual(
+      journalOperations.map((operation) => ({
+        accountCode: operation.data?.accountCode,
+        amountCents: operation.data?.amountCents,
+        side: operation.data?.side,
+      })),
+      [
+        { accountCode: 'mileage', amountCents: 760, side: 'debit' },
+        { accountCode: 'cash_on_hand', amountCents: 760, side: 'credit' },
+      ],
+    );
+  } finally {
+    restoreEnvironment(previous);
+  }
+});
+
 test('correcting a synthetic eBay review replaces the placeholder source row', async () => {
   const environmentNames = [
     'APPWRITE_BOOKS_DATABASE_ID',
