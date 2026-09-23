@@ -931,7 +931,7 @@ test('correcting a synthetic eBay review replaces the placeholder source row', a
   }
 });
 
-test('Plaid Link tokens are created server-side with the Android package and no secret in the mobile payload', async () => {
+test('Plaid Link tokens are created server-side with the web redirect and no secret in the client payload', async () => {
   const environmentNames = [
     'APPWRITE_BOOKS_DATABASE_ID',
     'APPWRITE_FUNCTION_API_ENDPOINT',
@@ -945,6 +945,7 @@ test('Plaid Link tokens are created server-side with the Android package and no 
     'PLAID_SECRET',
     'PLAID_TOKEN_ENCRYPTION_KEY',
     'PLAID_TRANSACTIONS_DAYS_REQUESTED',
+    'PLAID_WEB_REDIRECT_URI',
     'PLAID_WEBHOOK_SECRET',
     'PLAID_WEBHOOK_URL',
   ];
@@ -964,6 +965,7 @@ test('Plaid Link tokens are created server-side with the Android package and no 
     PLAID_SECRET: 'server-only-secret',
     PLAID_TOKEN_ENCRYPTION_KEY: Buffer.alloc(32).toString('base64'),
     PLAID_TRANSACTIONS_DAYS_REQUESTED: '90',
+    PLAID_WEB_REDIRECT_URI: 'https://keepflip.example/KeepFlip-newUi/books',
     PLAID_WEBHOOK_SECRET: 'webhook-secret',
     PLAID_WEBHOOK_URL: 'https://hooks.example/keepflip/plaid',
   });
@@ -996,6 +998,7 @@ test('Plaid Link tokens are created server-side with the Android package and no 
         },
         method: 'POST',
         path: '/plaid/link-token',
+        bodyJson: { platform: 'web' },
       },
       res: {
         json(body, status = 200) {
@@ -1015,11 +1018,11 @@ test('Plaid Link tokens are created server-side with the Android package and no 
     });
     assert.equal(plaidRequests.length, 1);
     assert.deepEqual(plaidRequests[0].body, {
-      android_package_name: 'com.keepflip.app',
       client_name: 'KeepFlip',
       country_codes: ['US'],
       language: 'en',
       products: ['transactions'],
+      redirect_uri: 'https://keepflip.example/KeepFlip-newUi/books',
       transactions: { days_requested: 90 },
       user: { client_user_id: 'user-1' },
       webhook: 'https://hooks.example/keepflip/plaid?secret=webhook-secret',

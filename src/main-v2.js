@@ -638,13 +638,9 @@ function plaidApiConfiguration() {
   const daysRequested = Number.isSafeInteger(daysRequestedValue)
     ? Math.min(Math.max(daysRequestedValue, 30), 730)
     : 90;
-
   return {
     ...plaidStorageConfiguration(),
-    androidPackageName: requiredEnvironment(
-      ['PLAID_ANDROID_PACKAGE_NAME'],
-      'Missing PLAID_ANDROID_PACKAGE_NAME for Android Link sessions.',
-    ),
+    androidPackageName: text(process.env.PLAID_ANDROID_PACKAGE_NAME, 255),
     baseUrl,
     clientId: requiredEnvironment(['PLAID_CLIENT_ID'], 'Missing PLAID_CLIENT_ID.'),
     countryCodes: countryCodes.length ? countryCodes : ['US'],
@@ -654,6 +650,26 @@ function plaidApiConfiguration() {
     webhookSecret: text(process.env.PLAID_WEBHOOK_SECRET, 255),
     webhookUrl: text(process.env.PLAID_WEBHOOK_URL, 1_000),
   };
+}
+
+function plaidWebRedirectUri(configuration) {
+  const redirectUri = requiredEnvironment(
+    ['PLAID_WEB_REDIRECT_URI'],
+    'Missing PLAID_WEB_REDIRECT_URI for web Link sessions.',
+  );
+  let parsedRedirectUri;
+  try {
+    parsedRedirectUri = new URL(redirectUri);
+  } catch {
+    throw new ReviewHttpError(500, 'PLAID_WEB_REDIRECT_URI must be a valid absolute URI.');
+  }
+  if (parsedRedirectUri.search || parsedRedirectUri.hash || parsedRedirectUri.username || parsedRedirectUri.password) {
+    throw new ReviewHttpError(500, 'PLAID_WEB_REDIRECT_URI must not contain query, fragment, or credentials.');
+  }
+  if (configuration.environment === 'production' && parsedRedirectUri.protocol !== 'https:') {
+    throw new ReviewHttpError(500, 'PLAID_WEB_REDIRECT_URI must use HTTPS in production.');
+  }
+  return redirectUri;
 }
 
 async function plaidJson({ configuration, path, body, fetchImpl }) {
@@ -861,13 +877,26 @@ async function savePlaidTransaction({ apiKey, configuration, data, existing, fet
 async function handlePlaidLinkToken({ req, res, runtime, fetchImpl }) {
   const ownerId = await authenticatedUserId({ fetchImpl, req, runtime });
   const configuration = plaidApiConfiguration();
+  const platform = text(requestBody(req).platform, 20);
+  if (platform !== 'android' && platform !== 'web') {
+    throw new ReviewHttpError(400, 'Plaid Link platform must be android or web.');
+  }
+  let platformParameters;
+  if (platform === 'android') {
+    if (!configuration.androidPackageName) {
+      throw new ReviewHttpError(500, 'Missing PLAID_ANDROID_PACKAGE_NAME for Android Link sessions.');
+    }
+    platformParameters = { android_package_name: configuration.androidPackageName };
+  } else {
+    platformParameters = { redirect_uri: plaidWebRedirectUri(configuration) };
+  }
   const payload = await plaidJson({
     body: {
-      android_package_name: configuration.androidPackageName,
       client_name: 'KeepFlip',
       country_codes: configuration.countryCodes,
       language: 'en',
       products: ['transactions'],
+      ...platformParameters,
       transactions: { days_requested: configuration.daysRequested },
       user: { client_user_id: ownerId },
       ...(configuration.webhookUrl
