@@ -74,6 +74,7 @@ const BOOKS_CAPABILITY_BY_PATH = new Map([
   ['/plaid/sync', 'automated_books'],
   ['/plaid/disconnect', 'automated_books'],
 ]);
+const FREE_BOOKS_CAPABILITIES = new Set(['basic_books', 'automated_books']);
 
 const BOOKS_PLAN_FEATURES = {
   hobbyist: new Set(['basic_books']),
@@ -297,7 +298,9 @@ function dateMs(value) {
 }
 
 function subscriptionAllowsBooksCapability(row, ownerId, capability, now = Date.now()) {
-  if (ownerIdFromRow(row) !== ownerId) return false;
+  if (row && ownerIdFromRow(row) !== ownerId) return false;
+  if (FREE_BOOKS_CAPABILITIES.has(capability)) return true;
+  if (!row) return false;
 
   const plan = text(row?.plan, 32).toLowerCase();
   const status = text(row?.status, 32).toLowerCase();
