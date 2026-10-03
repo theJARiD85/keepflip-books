@@ -298,8 +298,10 @@ function dateMs(value) {
 }
 
 function subscriptionAllowsBooksCapability(row, ownerId, capability, now = Date.now()) {
-  if (row && ownerIdFromRow(row) !== ownerId) return false;
+  // The authenticated caller is already bound to ownerId. Universal Books
+  // capabilities do not depend on a well-formed subscription mirror row.
   if (FREE_BOOKS_CAPABILITIES.has(capability)) return true;
+  if (row && ownerIdFromRow(row) !== ownerId) return false;
   if (!row) return false;
 
   const plan = text(row?.plan, 32).toLowerCase();
