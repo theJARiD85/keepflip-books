@@ -31,6 +31,8 @@ const BOOK_ACCOUNT_SEEDS = Object.freeze([
   ['resaleRevenue', 'Resale revenue', 'income'],
   ['salesReturns', 'Refunds and returns', 'income'],
   ['costOfGoodsSold', 'Cost of goods sold', 'expense'],
+  ['inventoryWriteOffs', 'Inventory write-offs', 'expense'],
+  ['inventoryValuationLoss', 'Inventory valuation loss', 'expense'],
   ['marketplaceFees', 'Marketplace fees', 'expense'],
   ['shippingLabels', 'Shipping expense', 'expense'],
   ['repairs', 'Repairs', 'expense'],
@@ -330,7 +332,7 @@ function storedInventoryQuantity(value, field, fallback = 1) {
   return quantity;
 }
 
-function saleQuantity(value) {
+function saleQuantity(value, action = 'sold') {
   if (value == null || value === '') return 1;
   const quantity = Number(value);
   if (
@@ -340,18 +342,19 @@ function saleQuantity(value) {
   ) {
     throw new HttpError(
       400,
-      `Quantity sold must be a whole number from 1 through ${MAX_INVENTORY_QUANTITY.toLocaleString()}.`,
+      `Quantity ${action} must be a whole number from 1 through ${MAX_INVENTORY_QUANTITY.toLocaleString()}.`,
     );
   }
   return quantity;
 }
 
 /**
- * Apportions a saved lot's remaining cost in whole cents. Partial sales round
- * down; the final unit receives any remainder so total COGS always equals the
- * original cost of the lot exactly.
+ * Uses per-lot average-cost allocation: each saved acquisition row is its own
+ * cost pool. Partial removals round down; the final units receive any remainder
+ * so the row's total cost is fully relieved. Units with different acquisition
+ * costs belong in separate inventory rows.
  */
-export function inventorySaleState(item, requestedQuantity = 1) {
+export function inventorySaleState(item, requestedQuantity = 1, quantityAction = 'sold') {
   const quantityBefore = storedInventoryQuantity(
     item?.quantityOnHand,
     'Stored item quantity',
@@ -360,7 +363,7 @@ export function inventorySaleState(item, requestedQuantity = 1) {
     throw new HttpError(400, 'This inventory item has no units left to sell.');
   }
 
-  const quantity = saleQuantity(requestedQuantity);
+  const quantity = saleQuantity(requestedQuantity, quantityAction);
   if (quantity > quantityBefore) {
     throw new HttpError(
       400,
@@ -527,6 +530,15 @@ function sourceEventData({ ownerId, source, externalKey, sourceType, eventStatus
   };
 }
 
+export function itemUpdateForWriteOff({ sale, now }) {
+  return {
+    inventoryCostCentsOnHand: sale.inventoryCostCentsOnHand,
+    quantityOnHand: sale.quantityOnHand,
+    updatedAt: now,
+    ...(sale.quantityOnHand === 0 ? { resaleStatus: 'written_off' } : {}),
+  };
+}
+
 function reviewSourceTypeForEvent(event) {
   const raw =
     text(event?.reviewSourceType, 60).toLowerCase() ||
@@ -685,6 +697,12 @@ export async function persistEntry({
     payoutId: payoutId || null,
     reversesTransactionId: null,
     source,
+    ...(entry.eventType === 'sale' || entry.eventType === 'inventory_write_off'
+      ? { costCents: entry.costCents }
+      : {}),
+    ...(entry.eventType === 'sale'
+      ? { shippingCostCents: entry.shippingCents }
+      : {}),
   };
   const sourceData = {
     ...sourceEventData({
@@ -844,6 +862,31 @@ function manualSourceKey(body, eventType) {
   return key;
 }
 
+async function transactionsForOrder({
+  runtime,
+  configuration,
+  apiKey,
+  ownerId,
+  orderId,
+  fetchImpl,
+}) {
+  if (!orderId) return [];
+  const payload = await appwriteJson({
+    apiKey,
+    failureMessage: 'KeepFlip could not verify the linked order in Books.',
+    fetchImpl,
+    path: listRowsPath(configuration, configuration.transactionsTableId, [
+      createQuery('equal', 'ownerId', [ownerId]),
+      createQuery('equal', 'orderId', [orderId]),
+      createQuery('limit', '', [1000]),
+    ]),
+    runtime,
+  });
+  return (Array.isArray(payload?.rows) ? payload.rows : []).filter(
+    (row) => ownerIdFromRow(row) === ownerId,
+  );
+}
+
 async function handleManualRecord({ req, res, runtime, fetchImpl, now }) {
   const body = requestBody(req);
   const ownerId = await authenticatedUserId({ fetchImpl, req, runtime });
@@ -854,7 +897,9 @@ async function handleManualRecord({ req, res, runtime, fetchImpl, now }) {
   const externalKey = manualSourceKey(body, eventType);
   const source = 'manual';
   const itemId = text(body.itemId, 64) || null;
+  const orderId = text(body.orderId, 180) || null;
   const notes = text(body.notes, 1_000) || null;
+  const shippingCents = optionalIntegerCents(body.shippingCents, 'Shipping cost');
   let entry;
   let itemUpdate;
 
@@ -869,6 +914,22 @@ async function handleManualRecord({ req, res, runtime, fetchImpl, now }) {
         ownerId,
         runtime,
       });
+      if (orderId && shippingCents != null) {
+        const linkedOrderEntries = await transactionsForOrder({
+          apiKey,
+          configuration,
+          fetchImpl,
+          orderId,
+          ownerId,
+          runtime,
+        });
+        if (linkedOrderEntries.some((row) => row.eventType === 'shipping_label')) {
+          throw new HttpError(
+            409,
+            'This order already has a separate shipping label in Books. Leave sale shipping blank so the label is counted once.',
+          );
+        }
+      }
       const sale = inventorySaleState(item, body.quantity);
       entry = postBookkeepingEvent({
         costCents: sale.costCents,
@@ -882,16 +943,98 @@ async function handleManualRecord({ req, res, runtime, fetchImpl, now }) {
         occurredAt,
         sourceKey: `${source}:${eventType}:${externalKey}`,
         summary: 'Manual sale',
+        shippingCents,
       });
       itemUpdate = itemUpdateForSale({
         externalKey,
         occurredAt,
-        orderId: text(body.orderId, 180) || null,
+        orderId,
         ownerId,
         sale,
         source,
         now,
       });
+    } else if (
+      eventType === 'inventory_write_off' ||
+      eventType === 'inventory_value_adjustment'
+    ) {
+      if (!itemId) {
+        throw new HttpError(400, 'Choose the inventory item to adjust.');
+      }
+      if (!notes) {
+        throw new HttpError(400, 'Add a reason so this inventory adjustment has an audit note.');
+      }
+      const item = await getOwnedItem({
+        apiKey,
+        configuration,
+        fetchImpl,
+        itemId,
+        ownerId,
+        runtime,
+      });
+      const currentCostCents = optionalIntegerCents(
+        item.inventoryCostCentsOnHand,
+        'Current on-hand inventory value',
+      ) ?? optionalIntegerCents(item.acquisitionCostCents, 'Original item cost');
+      if (currentCostCents == null) {
+        throw new HttpError(
+          409,
+          'Add the item’s actual acquisition cost before writing down or removing its value.',
+        );
+      }
+
+      if (eventType === 'inventory_write_off') {
+        const sale = inventorySaleState(item, body.quantity, 'written off');
+        if (sale.costCents == null) {
+          throw new HttpError(409, 'KeepFlip needs the actual cost before writing off these units.');
+        }
+        entry = postBookkeepingEvent({
+          costCents: sale.costCents,
+          currency: 'USD',
+          eventType,
+          itemId,
+          notes,
+          occurredAt,
+          sourceKey: `${source}:${eventType}:${externalKey}`,
+          summary: 'Inventory write-off',
+        });
+        itemUpdate = itemUpdateForWriteOff({ now, sale });
+      } else {
+        const quantityOnHand = storedInventoryQuantity(
+          item.quantityOnHand,
+          'Stored item quantity',
+        );
+        if (quantityOnHand < 1) {
+          throw new HttpError(409, 'This item has no inventory value left to adjust.');
+        }
+        const newValueCents = optionalIntegerCents(
+          body.newInventoryValueCents,
+          'New on-hand inventory value',
+        );
+        if (newValueCents == null) {
+          throw new HttpError(400, 'Enter the new total value of the units still on hand.');
+        }
+        if (newValueCents >= currentCostCents) {
+          throw new HttpError(
+            400,
+            'The new inventory value must be lower than its current carrying value. Use the original cost unless a documented decrease is needed.',
+          );
+        }
+        entry = postBookkeepingEvent({
+          amountCents: currentCostCents - newValueCents,
+          currency: 'USD',
+          eventType,
+          itemId,
+          notes,
+          occurredAt,
+          sourceKey: `${source}:${eventType}:${externalKey}`,
+          summary: 'Inventory carrying value adjustment',
+        });
+        itemUpdate = {
+          inventoryCostCentsOnHand: newValueCents,
+          updatedAt: now,
+        };
+      }
     } else {
       const amountCents = integerCents(body.amountCents);
       if (eventType === 'inventory_purchase' && !itemId) {
@@ -910,6 +1053,26 @@ async function handleManualRecord({ req, res, runtime, fetchImpl, now }) {
         sourceKey: `${source}:${eventType}:${externalKey}`,
         summary: text(body.summary, 255) || undefined,
       });
+      if (eventType === 'shipping_label' && orderId) {
+        const linkedOrderEntries = await transactionsForOrder({
+          apiKey,
+          configuration,
+          fetchImpl,
+          orderId,
+          ownerId,
+          runtime,
+        });
+        if (
+          linkedOrderEntries.some(
+            (row) => row.eventType === 'sale' && row.shippingCostCents != null,
+          )
+        ) {
+          throw new HttpError(
+            409,
+            'This sale already includes its shipping cost. Remove that amount before recording a separate label.',
+          );
+        }
+      }
       if (eventType === 'inventory_purchase' && itemId) {
         itemUpdate = {
           bookPurchaseTransactionId: transactionRowId(ownerId, source, externalKey),
@@ -931,7 +1094,7 @@ async function handleManualRecord({ req, res, runtime, fetchImpl, now }) {
     fetchImpl,
     itemUpdate,
     now,
-    orderId: text(body.orderId, 180) || null,
+    orderId,
     ownerId,
     payoutId: text(body.payoutId, 180) || null,
     runtime,
@@ -1800,12 +1963,20 @@ function overviewEventForLine(row) {
     id: text(row?.$id, 64),
     itemId: text(row?.itemId, 64) || null,
     occurredAt: text(row?.occurredAt, 64),
+    orderId: text(row?.orderId, 180) || null,
+    transactionId: text(row?.bookTransactionId, 64) || null,
   };
   if (side === 'credit' && accountCode === BOOK_ACCOUNT.resaleRevenue) {
     return { ...base, direction: 'income', entryType: 'sale_proceeds' };
   }
   if (side === 'credit' && accountCode === BOOK_ACCOUNT.ebayCredits) {
     return { ...base, direction: 'income', entryType: 'other_income' };
+  }
+  if (side === 'debit' && accountCode === BOOK_ACCOUNT.inventoryWriteOffs) {
+    return { ...base, direction: 'adjustment', entryType: 'inventory_write_off' };
+  }
+  if (side === 'debit' && accountCode === BOOK_ACCOUNT.inventoryValuationLoss) {
+    return { ...base, direction: 'adjustment', entryType: 'inventory_value_adjustment' };
   }
   const expenseType = {
     [BOOK_ACCOUNT.inventory]: 'inventory_purchase',
@@ -1826,27 +1997,233 @@ function overviewEventForLine(row) {
   return null;
 }
 
+function saleMarginsForRows(transactionRows, journalRows) {
+  const transactions = transactionRows.filter((row) =>
+    ['sale', 'shipping_label'].includes(text(row?.eventType, 60)),
+  );
+  const transactionById = new Map(
+    transactions.map((row) => [text(row?.$id, 64), row]),
+  );
+  const linesByTransaction = new Map();
+  for (const line of journalRows) {
+    const transactionId = text(line?.bookTransactionId, 64);
+    if (!transactionId || !transactionById.has(transactionId)) continue;
+    const grouped = linesByTransaction.get(transactionId) ?? [];
+    grouped.push(line);
+    linesByTransaction.set(transactionId, grouped);
+  }
+
+  const salesByKey = new Map();
+  for (const transaction of transactions) {
+    if (text(transaction?.eventType, 60) !== 'sale') continue;
+    const transactionId = text(transaction?.$id, 64);
+    const orderId = text(transaction?.orderId, 180) || null;
+    const groupKey = orderId ? `order:${orderId}` : `sale:${transactionId}`;
+    const group = salesByKey.get(groupKey) ?? {
+      id: orderId || transactionId,
+      orderId,
+      transactions: [],
+    };
+    group.transactions.push(transaction);
+    salesByKey.set(groupKey, group);
+  }
+
+  const labelsByOrder = new Map();
+  for (const transaction of transactions) {
+    if (text(transaction?.eventType, 60) !== 'shipping_label') continue;
+    const orderId = text(transaction?.orderId, 180);
+    if (!orderId) continue;
+    const transactionId = text(transaction?.$id, 64);
+    const lineTotal = (linesByTransaction.get(transactionId) ?? []).reduce(
+      (total, line) => {
+        const amountCents = Number(line?.amountCents);
+        return text(line?.accountCode, 80) === BOOK_ACCOUNT.shippingLabels &&
+          text(line?.side, 16) === 'debit' &&
+          Number.isSafeInteger(amountCents) &&
+          amountCents > 0
+          ? total + amountCents
+          : total;
+      },
+      0,
+    );
+    if (lineTotal <= 0) continue;
+    const existing = labelsByOrder.get(orderId) ?? { count: 0, amountCents: 0 };
+    labelsByOrder.set(orderId, {
+      count: existing.count + 1,
+      amountCents: existing.amountCents + lineTotal,
+    });
+  }
+
+  return [...salesByKey.values()].map((group) => {
+    let grossSaleCents = 0;
+    let feeCents = 0;
+    let costCents = 0;
+    let costKnown = true;
+    let directShippingCents = 0;
+    let directShippingKnown = true;
+    let hasDirectShipping = false;
+    let occurredAt = '';
+    const itemIds = new Set();
+
+    for (const transaction of group.transactions) {
+      const transactionId = text(transaction?.$id, 64);
+      const lines = linesByTransaction.get(transactionId) ?? [];
+      const transactionCostLineCents = lines.reduce((total, line) => {
+        const amountCents = Number(line?.amountCents);
+        return text(line?.accountCode, 80) === BOOK_ACCOUNT.costOfGoodsSold &&
+          text(line?.side, 16) === 'debit' &&
+          Number.isSafeInteger(amountCents) &&
+          amountCents > 0
+          ? total + amountCents
+          : total;
+      }, 0);
+      const rawTransactionCost = transaction?.costCents;
+      const transactionCost = Number(rawTransactionCost);
+      const hasStoredCost =
+        rawTransactionCost != null &&
+        Number.isSafeInteger(transactionCost) &&
+        transactionCost >= 0;
+      if (hasStoredCost) costCents += transactionCost;
+      else if (transactionCostLineCents > 0) costCents += transactionCostLineCents;
+      else costKnown = false;
+
+      const rawTransactionShipping = transaction?.shippingCostCents;
+      const transactionShipping = Number(rawTransactionShipping);
+      const hasStoredShipping =
+        rawTransactionShipping != null &&
+        Number.isSafeInteger(transactionShipping) &&
+        transactionShipping >= 0;
+      const transactionShippingLineCents = lines.reduce((total, line) => {
+        const amountCents = Number(line?.amountCents);
+        return text(line?.accountCode, 80) === BOOK_ACCOUNT.shippingLabels &&
+          text(line?.side, 16) === 'debit' &&
+          Number.isSafeInteger(amountCents) &&
+          amountCents > 0
+          ? total + amountCents
+          : total;
+      }, 0);
+      if (hasStoredShipping) {
+        hasDirectShipping = true;
+        directShippingCents += transactionShipping;
+      } else if (transactionShippingLineCents > 0) {
+        hasDirectShipping = true;
+        directShippingCents += transactionShippingLineCents;
+      } else {
+        directShippingKnown = false;
+      }
+
+      for (const line of lines) {
+        const amountCents = Number(line?.amountCents);
+        if (!Number.isSafeInteger(amountCents) || amountCents <= 0) continue;
+        if (
+          text(line?.accountCode, 80) === BOOK_ACCOUNT.resaleRevenue &&
+          text(line?.side, 16) === 'credit'
+        ) grossSaleCents += amountCents;
+        if (
+          text(line?.accountCode, 80) === BOOK_ACCOUNT.marketplaceFees &&
+          text(line?.side, 16) === 'debit'
+        ) feeCents += amountCents;
+      }
+
+      const itemId = text(transaction?.itemId, 64);
+      if (itemId) itemIds.add(itemId);
+      const saleDate = text(transaction?.occurredAt, 80);
+      if (saleDate && (!occurredAt || saleDate < occurredAt)) occurredAt = saleDate;
+    }
+
+    const linkedLabels = group.orderId ? labelsByOrder.get(group.orderId) : null;
+    const shippingConflict = Boolean(linkedLabels && hasDirectShipping);
+    const shippingKnown =
+      !shippingConflict && (linkedLabels != null || directShippingKnown);
+    const shippingCents = shippingConflict
+      ? null
+      : linkedLabels
+        ? linkedLabels.amountCents
+        : directShippingKnown
+          ? directShippingCents
+          : null;
+    const itemId = itemIds.size === 1 ? [...itemIds][0] : null;
+    const netProfitCents =
+      costKnown && shippingKnown && grossSaleCents > 0
+        ? grossSaleCents - feeCents - (shippingCents ?? 0) - costCents
+        : null;
+
+    return {
+      costCents: costKnown ? costCents : null,
+      feeCents,
+      grossSaleCents,
+      id: group.id,
+      itemCount: itemIds.size,
+      itemId,
+      netProfitCents,
+      occurredAt,
+      orderId: group.orderId,
+      saleCount: group.transactions.length,
+      shippingCents,
+      shippingKnown,
+      shippingConflict,
+    };
+  });
+}
+
 async function handleOverview({ req, res, runtime, fetchImpl }) {
   const ownerId = await authenticatedUserId({ fetchImpl, req, runtime });
   const apiKey = dynamicApiKey(req);
   const configuration = tableConfiguration();
-  const payload = await appwriteJson({
-    apiKey,
-    failureMessage: 'KeepFlip could not load the Books overview.',
-    fetchImpl,
-    path: listRowsPath(configuration, configuration.journalLinesTableId, [
-      createQuery('equal', 'ownerId', [ownerId]),
-      createQuery('orderDesc', 'occurredAt'),
-      createQuery('limit', '', [1000]),
-    ]),
-    runtime,
-  });
-  const rows = Array.isArray(payload?.rows) ? payload.rows : [];
+  const [linePayload, transactionPayload] = await Promise.all([
+    appwriteJson({
+      apiKey,
+      failureMessage: 'KeepFlip could not load the Books overview.',
+      fetchImpl,
+      path: listRowsPath(configuration, configuration.journalLinesTableId, [
+        createQuery('equal', 'ownerId', [ownerId]),
+        createQuery('orderDesc', 'occurredAt'),
+        createQuery('limit', '', [1000]),
+      ]),
+      runtime,
+    }),
+    appwriteJson({
+      apiKey,
+      failureMessage: 'KeepFlip could not load linked Books transactions.',
+      fetchImpl,
+      path: listRowsPath(configuration, configuration.transactionsTableId, [
+        createQuery('equal', 'ownerId', [ownerId]),
+        createQuery('orderDesc', 'occurredAt'),
+        createQuery('limit', '', [1000]),
+      ]),
+      runtime,
+    }),
+  ]);
+  const rows = Array.isArray(linePayload?.rows) ? linePayload.rows : [];
+  const transactionRows = Array.isArray(transactionPayload?.rows)
+    ? transactionPayload.rows.filter((row) => ownerIdFromRow(row) === ownerId)
+    : [];
   const moneyEvents = rows.map(overviewEventForLine).filter(Boolean);
+  for (const transaction of transactionRows) {
+    const writtenOffCost = transaction?.costCents;
+    if (
+      text(transaction?.eventType, 60) === 'inventory_write_off' &&
+      writtenOffCost != null &&
+      Number(writtenOffCost) === 0
+    ) {
+      moneyEvents.push({
+        amountCents: 0,
+        direction: 'adjustment',
+        entryType: 'inventory_write_off',
+        id: text(transaction?.$id, 64),
+        itemId: text(transaction?.itemId, 64) || null,
+        occurredAt: text(transaction?.occurredAt, 64),
+        orderId: text(transaction?.orderId, 180) || null,
+        transactionId: text(transaction?.$id, 64) || null,
+      });
+    }
+  }
+  const saleMargins = saleMarginsForRows(transactionRows, rows);
   return res.json({
     moneyEvents,
     ok: true,
-    truncated: rows.length >= 1000,
+    saleMargins,
+    truncated: rows.length >= 1000 || transactionRows.length >= 1000,
   });
 }
 

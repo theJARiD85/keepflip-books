@@ -16,6 +16,8 @@ export const BOOK_ACCOUNT = Object.freeze({
   resaleRevenue: 'resale_revenue',
   salesReturns: 'refunds_and_returns',
   costOfGoodsSold: 'cost_of_goods_sold',
+  inventoryWriteOffs: 'inventory_write_off_loss',
+  inventoryValuationLoss: 'inventory_valuation_loss',
   marketplaceFees: 'marketplace_fees',
   shippingLabels: 'shipping_expense',
   repairs: 'repairs',
@@ -180,6 +182,7 @@ export function assertBalancedJournal(lines) {
 function buildEntry({
   amountCents,
   currency = 'USD',
+  costCents = null,
   eventType,
   grossProfitCents = null,
   itemId = null,
@@ -190,6 +193,7 @@ function buildEntry({
   occurredAt,
   sourceKey,
   summary,
+  shippingCents = null,
   lines,
 }) {
   assertCents(amountCents);
@@ -208,6 +212,15 @@ function buildEntry({
   if (!Number.isSafeInteger(moneyOutCents) || moneyOutCents < 0) {
     throw new BookkeepingValidationError('Money out must be whole cents.');
   }
+  if (costCents != null && (!Number.isSafeInteger(costCents) || costCents < 0)) {
+    throw new BookkeepingValidationError('Item cost must be whole cents.');
+  }
+  if (
+    shippingCents != null &&
+    (!Number.isSafeInteger(shippingCents) || shippingCents < 0)
+  ) {
+    throw new BookkeepingValidationError('Shipping cost must be whole cents.');
+  }
   if (
     grossProfitCents != null &&
     (!Number.isSafeInteger(grossProfitCents) || !Number.isFinite(grossProfitCents))
@@ -219,6 +232,7 @@ function buildEntry({
   return {
     amountCents,
     currency: normalizedCurrency,
+    costCents,
     eventType: text(eventType, 60),
     grossProfitCents,
     itemId: text(itemId, 64) || null,
@@ -229,6 +243,44 @@ function buildEntry({
     needsCostReview: Boolean(needsCostReview),
     notes: text(notes, 1_000) || null,
     occurredAt: text(occurredAt, 64),
+    sourceKey: text(sourceKey, 255),
+    summary: text(summary, 255),
+    shippingCents,
+  };
+}
+
+function buildNonFinancialEntry({
+  currency = 'USD',
+  eventType,
+  itemId,
+  notes,
+  occurredAt,
+  sourceKey,
+  summary,
+}) {
+  const normalizedCurrency = text(currency, 8).toUpperCase();
+  if (!/^[A-Z]{3}$/.test(normalizedCurrency)) {
+    throw new BookkeepingValidationError('Currency must be a three-letter code.');
+  }
+  if (!text(eventType, 60) || !text(sourceKey, 255) || !text(summary, 255)) {
+    throw new BookkeepingValidationError(
+      'Bookkeeping entries need an event type, source key, and summary.',
+    );
+  }
+  return {
+    amountCents: 0,
+    costCents: 0,
+    currency: normalizedCurrency,
+    eventType: text(eventType, 60),
+    grossProfitCents: null,
+    itemId: text(itemId, 64) || null,
+    lines: [],
+    moneyInCents: 0,
+    moneyOutCents: 0,
+    needsCostReview: false,
+    notes: text(notes, 1_000) || null,
+    occurredAt: text(occurredAt, 64),
+    shippingCents: null,
     sourceKey: text(sourceKey, 255),
     summary: text(summary, 255),
   };
@@ -256,6 +308,7 @@ export function postSale(input) {
     ? 0
     : Number(input.marketplaceCollectedTaxCents);
   const costCents = input?.costCents == null ? null : Number(input.costCents);
+  const shippingCents = input?.shippingCents == null ? null : Number(input.shippingCents);
 
   if (!Number.isSafeInteger(feeCents) || feeCents < 0) {
     throw new BookkeepingValidationError('Marketplace fees must be whole cents.');
@@ -265,6 +318,12 @@ export function postSale(input) {
   }
   if (costCents != null && (!Number.isSafeInteger(costCents) || costCents < 0)) {
     throw new BookkeepingValidationError('Item cost must be whole cents.');
+  }
+  if (
+    shippingCents != null &&
+    (!Number.isSafeInteger(shippingCents) || shippingCents < 0)
+  ) {
+    throw new BookkeepingValidationError('Shipping cost must be whole cents.');
   }
 
   const lines = [
@@ -297,6 +356,13 @@ export function postSale(input) {
     );
   }
 
+  if (shippingCents > 0) {
+    lines.push(
+      debit(BOOK_ACCOUNT.shippingLabels, shippingCents, 'Shipping paid for this sale'),
+      credit(BOOK_ACCOUNT.cash, shippingCents, 'Shipping paid outside marketplace'),
+    );
+  }
+
   if (costCents != null && costCents > 0) {
     lines.push(
       debit(BOOK_ACCOUNT.costOfGoodsSold, costCents, 'Original item cost'),
@@ -307,14 +373,59 @@ export function postSale(input) {
   return buildEntry({
     ...input,
     amountCents: grossSaleCents,
+    costCents,
     eventType: 'sale',
     grossProfitCents:
-      costCents == null ? null : grossSaleCents - feeCents - costCents,
+      costCents == null || shippingCents == null
+        ? null
+        : grossSaleCents - feeCents - shippingCents - costCents,
     moneyInCents: grossSaleCents,
-    moneyOutCents: feeCents,
+    moneyOutCents: feeCents + (shippingCents ?? 0),
     needsCostReview: costCents == null,
     summary: input?.summary || 'Marketplace sale',
+    shippingCents,
     lines,
+  });
+}
+
+export function postInventoryWriteOff(input) {
+  const costCents = input?.costCents == null ? null : Number(input.costCents);
+  if (!Number.isSafeInteger(costCents) || costCents < 0) {
+    throw new BookkeepingValidationError('Written-off item cost must be whole cents.');
+  }
+  if (costCents === 0) {
+    return buildNonFinancialEntry({
+      ...input,
+      eventType: 'inventory_write_off',
+      summary: input?.summary || 'Zero-cost inventory written off',
+    });
+  }
+  return buildEntry({
+    ...input,
+    amountCents: costCents,
+    costCents,
+    eventType: 'inventory_write_off',
+    moneyOutCents: 0,
+    summary: input?.summary || 'Inventory written off',
+    lines: [
+      debit(BOOK_ACCOUNT.inventoryWriteOffs, costCents, 'Unsellable or missing inventory'),
+      credit(BOOK_ACCOUNT.inventory, costCents, 'Item removed from inventory'),
+    ],
+  });
+}
+
+export function postInventoryValueAdjustment(input) {
+  const amountCents = assertCents(input?.amountCents, 'Inventory value reduction');
+  return buildEntry({
+    ...input,
+    amountCents,
+    eventType: 'inventory_value_adjustment',
+    moneyOutCents: 0,
+    summary: input?.summary || 'Inventory carrying value reduced',
+    lines: [
+      debit(BOOK_ACCOUNT.inventoryValuationLoss, amountCents, 'Inventory carrying value reduction'),
+      credit(BOOK_ACCOUNT.inventory, amountCents, 'Inventory asset value reduced'),
+    ],
   });
 }
 
@@ -406,6 +517,10 @@ export function postBookkeepingEvent(input) {
       return postInventoryPurchase(input);
     case 'sale':
       return postSale(input);
+    case 'inventory_write_off':
+      return postInventoryWriteOff(input);
+    case 'inventory_value_adjustment':
+      return postInventoryValueAdjustment(input);
     case 'shipping_label':
     case 'refund':
     case 'marketplace_fee':

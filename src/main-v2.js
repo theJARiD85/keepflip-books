@@ -1883,6 +1883,13 @@ async function confirmCostReview({ loaded, runtime, fetchImpl, now }) {
   operations.push(
     {
       action: 'update',
+      data: { costCents },
+      databaseId: configuration.databaseId,
+      rowId: saleBookTransactionId,
+      tableId: configuration.transactionsTableId,
+    },
+    {
+      action: 'update',
       data: itemPatch,
       databaseId: configuration.databaseId,
       rowId: itemId,
